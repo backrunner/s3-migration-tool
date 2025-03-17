@@ -3,8 +3,12 @@ import chalk from 'chalk';
 import cliProgress from 'cli-progress';
 import ora from 'ora';
 import inquirer from 'inquirer';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as fsExtra from 'fs-extra';
 import type { MigrationConfig, FileTransfer } from './types';
-import { TransferStatus } from './types';
+import { TransferStatus, TransferMode } from './types';
 import {
   createS3Client,
   downloadObject,
@@ -39,6 +43,7 @@ interface MigrationStats {
   failedFiles: FileTransfer[];
   paused: boolean;
   endTime?: number;
+  transfersByMode?: FileTransfer[];
 }
 
 /**
@@ -62,6 +67,42 @@ function formatSpeed(bytesPerSecond: number): string {
 }
 
 /**
+ * 获取系统可用内存（字节）
+ */
+function getAvailableMemory(): number {
+  return os.freemem();
+}
+
+/**
+ * 自动确定文件传输模式
+ */
+function determineTransferMode(fileSize: number, config: MigrationConfig): TransferMode {
+  // 如果配置中已经指定了传输模式，则使用指定的模式
+  if (config.transferMode && config.transferMode !== TransferMode.AUTO) {
+    return config.transferMode;
+  }
+
+  // 获取可用内存
+  const availableMemory = getAvailableMemory();
+  // 大文件阈值，默认为可用内存的50%
+  const largeFileThreshold = config.largeFileSizeThreshold || (availableMemory * 0.5);
+
+  // 如果文件小于阈值，使用内存模式
+  if (fileSize < largeFileThreshold) {
+    return TransferMode.MEMORY;
+  }
+
+  // 文件很大（接近或超过可用内存），使用磁盘或流模式
+  // 如果文件大于可用内存的95%，建议使用流模式
+  if (fileSize > availableMemory * 0.95) {
+    return TransferMode.STREAM;
+  }
+
+  // 否则使用磁盘模式
+  return TransferMode.DISK;
+}
+
+/**
  * Run the migration process
  */
 export async function runMigration(config: MigrationConfig): Promise<void> {
@@ -77,6 +118,26 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
     console.log(chalk.gray('Max Retries:'), chalk.yellow(config.maxRetries));
     console.log(chalk.gray('Verify After Migration:'), chalk.yellow(config.verifyAfterMigration));
     console.log(chalk.gray('Purge Source After Migration:'), chalk.yellow(config.purgeSourceAfterMigration));
+
+    // Initialize transfer mode if not already set
+    if (!config.transferMode) {
+      config.transferMode = TransferMode.AUTO;
+    }
+    console.log(chalk.gray('Transfer Mode:'), chalk.yellow(config.transferMode));
+
+    // Display available memory
+    const availableMemory = getAvailableMemory();
+    console.log(chalk.gray('Available Memory:'), chalk.yellow(formatBytes(availableMemory)));
+
+    // Initialize temp directory if disk mode is possible
+    if (config.transferMode === TransferMode.AUTO || config.transferMode === TransferMode.DISK) {
+      // Use provided temp directory or create a default one
+      config.tempDir = config.tempDir || path.join(process.cwd(), 'tmp');
+      console.log(chalk.gray('Temp Directory:'), chalk.yellow(config.tempDir));
+
+      // Make sure temp directory exists
+      await fsExtra.ensureDir(config.tempDir);
+    }
 
     // Only display prefix if it's provided
     if (config.prefix) {
@@ -112,7 +173,8 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       verificationFailed: 0,
       startTime: Date.now(),
       failedFiles: [],
-      paused: false
+      paused: false,
+      transfersByMode: []
     };
 
     // List all objects
@@ -171,6 +233,67 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       retryCount: 0,
       progress: 0
     }));
+
+    // After listing and filtering objects, check for large files
+    if (stats.total > 0 && config.transferMode === TransferMode.AUTO) {
+      // Find the largest file
+      let largestFileSize = 0;
+      let largestFile = '';
+
+      for (const transfer of transfers) {
+        // Get file size if not already known
+        if (!transfer.size) {
+          try {
+            transfer.size = await getObjectSize(sourceClient, config.source.bucket, transfer.key);
+          } catch (error) {
+            logError(`Failed to get size for ${transfer.key}`, error as Error);
+            continue;
+          }
+        }
+
+        if (transfer.size && transfer.size > largestFileSize) {
+          largestFileSize = transfer.size;
+          largestFile = transfer.key;
+        }
+      }
+
+      // Calculate suggested transfer mode based on the largest file
+      const suggestedMode = determineTransferMode(largestFileSize, config);
+
+      // If largest file exceeds memory threshold, suggest appropriate transfer mode
+      if (suggestedMode !== TransferMode.MEMORY) {
+        console.log('');
+        console.log(chalk.yellow('Large file detected:'), chalk.blue(largestFile));
+        console.log(chalk.yellow('Size:'), chalk.blue(formatBytes(largestFileSize)));
+        console.log(chalk.yellow('Available memory:'), chalk.blue(formatBytes(availableMemory)));
+
+        if (!config.skipConfirmation) {
+          const { selectedMode } = await inquirer.prompt([
+            {
+              type: 'list',
+              name: 'selectedMode',
+              message: 'Choose a transfer mode for large files:',
+              choices: [
+                { name: `Memory (fastest, but may cause out-of-memory for files > ${formatBytes(availableMemory * 0.5)})`, value: TransferMode.MEMORY },
+                { name: `Disk (good balance, uses temp files in ${config.tempDir})`, value: TransferMode.DISK },
+                { name: 'Stream (slowest, but uses minimal memory)', value: TransferMode.STREAM },
+                { name: 'Auto (choose best mode based on file size)', value: TransferMode.AUTO }
+              ],
+              default: suggestedMode
+            }
+          ]);
+
+          config.transferMode = selectedMode;
+          console.log(chalk.blue(`Using transfer mode: ${config.transferMode}`));
+          log(LogLevel.INFO, `Transfer mode selected: ${config.transferMode}`);
+        } else {
+          // If confirmation is skipped, use the suggested mode
+          config.transferMode = suggestedMode;
+          console.log(chalk.blue(`Automatically selected transfer mode: ${config.transferMode}`));
+          log(LogLevel.INFO, `Transfer mode automatically selected: ${config.transferMode}`);
+        }
+      }
+    }
 
     // Show sample of files to migrate (first 10 files)
     if (transfers.length > 0) {
@@ -334,6 +457,12 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
               multibar.remove(progressBar);
               delete fileProgressBars[transfer.key];
             }
+
+            // 记录传输模式
+            if (!stats.transfersByMode) {
+              stats.transfersByMode = [];
+            }
+            stats.transfersByMode.push({ ...transfer });
           } catch (error) {
             // This should not happen as errors are handled in processObject
             console.error(chalk.red(`Unexpected error: ${(error as Error).message}`));
@@ -533,7 +662,8 @@ async function runMigrationForFiles(
     verificationFailed: 0,
     startTime: Date.now(),
     failedFiles: [],
-    paused: false
+    paused: false,
+    transfersByMode: []
   };
 
   log(LogLevel.INFO, `Starting migration of ${transfers.length} files from ${config.source.bucket} to ${config.target.bucket}`);
@@ -822,13 +952,26 @@ async function processObject(
   }
 
   try {
+    // Determine transfer mode based on file size
+    if (!transfer.transferMode && transfer.size) {
+      transfer.transferMode = determineTransferMode(transfer.size, config);
+      logVerbose(`Selected transfer mode for ${transfer.key}: ${transfer.transferMode}`);
+    }
+
+    // Create temp directory if needed
+    let tempDir = config.tempDir;
+    if (transfer.transferMode === TransferMode.DISK && !tempDir) {
+      tempDir = path.join(process.cwd(), 'tmp');
+      await fsExtra.ensureDir(tempDir);
+    }
+
     // Download from source
     transfer.status = TransferStatus.DOWNLOADING;
     progressBar.update(0, {
-      status: chalk.blue('Downloading'),
+      status: chalk.blue(`Downloading (${transfer.transferMode})`),
       speed: ''
     });
-    logVerbose(`Starting download of ${transfer.key}`);
+    logVerbose(`Starting download of ${transfer.key} using ${transfer.transferMode} mode`);
 
     const data = await downloadObject(
       sourceClient,
@@ -840,19 +983,26 @@ async function processObject(
         transfer.downloadSpeed = speed;
 
         progressBar.update(progress, {
-          status: chalk.blue('Downloading'),
+          status: chalk.blue(`Downloading (${transfer.transferMode})`),
           speed: formatSpeed(speed)
         });
-      }
+      },
+      transfer.transferMode,
+      tempDir
     );
 
     // Upload to target
     transfer.status = TransferStatus.UPLOADING;
     progressBar.update(50, {
-      status: chalk.blue('Uploading'),
+      status: chalk.blue(`Uploading (${transfer.transferMode})`),
       speed: ''
     });
-    logVerbose(`Starting upload of ${transfer.key} to target`);
+    logVerbose(`Starting upload of ${transfer.key} to target using ${transfer.transferMode} mode`);
+
+    // If using disk mode, store the temporary file path
+    if (typeof data === 'string') {
+      transfer.tempFilePath = data;
+    }
 
     await uploadObject(
       targetClient,
@@ -865,10 +1015,11 @@ async function processObject(
         transfer.uploadSpeed = speed;
 
         progressBar.update(progress, {
-          status: chalk.blue('Uploading'),
+          status: chalk.blue(`Uploading (${transfer.transferMode})`),
           speed: formatSpeed(speed)
         });
-      }
+      },
+      transfer.transferMode === TransferMode.DISK // 如果是磁盘模式，上传后删除临时文件
     );
 
     // Mark as succeeded
@@ -878,11 +1029,38 @@ async function processObject(
       speed: ''
     });
     stats.succeeded++;
-    logSuccess(`Successfully transferred: ${transfer.key}`);
+
+    // 记录传输模式
+    if (!stats.transfersByMode) {
+      stats.transfersByMode = [];
+    }
+    stats.transfersByMode.push({ ...transfer });
+
+    logSuccess(`Successfully transferred: ${transfer.key} using ${transfer.transferMode} mode`);
+
+    // Clean up temp file if it exists and wasn't automatically deleted
+    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
+      try {
+        await fs.promises.unlink(transfer.tempFilePath);
+        logVerbose(`Removed temporary file: ${transfer.tempFilePath}`);
+      } catch {
+        logWarning(`Failed to remove temporary file: ${transfer.tempFilePath}`);
+      }
+    }
   } catch (error) {
     const err = error as Error;
     transfer.error = err.message;
     logError(`Error transferring file: ${transfer.key}`, err);
+
+    // Clean up temp file if it exists
+    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
+      try {
+        await fs.promises.unlink(transfer.tempFilePath);
+        logVerbose(`Removed temporary file after error: ${transfer.tempFilePath}`);
+      } catch {
+        logWarning(`Failed to remove temporary file after error: ${transfer.tempFilePath}`);
+      }
+    }
 
     // Check if we should retry
     if (transfer.retryCount < maxRetries) {
@@ -925,6 +1103,14 @@ async function processObject(
 function printSummary(stats: MigrationStats): void {
   const elapsedSeconds = Math.floor(((stats.endTime || Date.now()) - stats.startTime) / 1000);
 
+  // Count by transfer mode
+  const transferModeCounts: Record<string, number> = {};
+
+  for (const transfer of stats.transfersByMode || []) {
+    const mode = transfer.transferMode || TransferMode.MEMORY;
+    transferModeCounts[mode] = (transferModeCounts[mode] || 0) + 1;
+  }
+
   console.log(chalk.blue.bold('Migration Summary'));
   console.log(chalk.blue('─'.repeat(50)));
   console.log(chalk.gray('Total objects:     '), chalk.white(stats.total.toString()));
@@ -933,6 +1119,17 @@ function printSummary(stats: MigrationStats): void {
   console.log(chalk.gray('Verification failed:'), chalk.red(stats.verificationFailed.toString()));
   console.log(chalk.gray('Skipped:           '), chalk.yellow(stats.skipped.toString()));
   console.log(chalk.gray('Total time:        '), chalk.white(formatTime(elapsedSeconds)));
+
+  // Print transfer mode stats if available
+  if (Object.keys(transferModeCounts).length > 0) {
+    console.log('');
+    console.log(chalk.blue.bold('Transfer Modes Used'));
+    console.log(chalk.blue('─'.repeat(50)));
+
+    for (const [mode, count] of Object.entries(transferModeCounts)) {
+      console.log(chalk.gray(`${mode}:`), chalk.white(count.toString()));
+    }
+  }
 
   // Log summary information
   log(LogLevel.INFO, `Migration Summary - Total: ${stats.total}, Succeeded: ${stats.succeeded}, Failed: ${stats.failed}, Verification failed: ${stats.verificationFailed}, Skipped: ${stats.skipped}, Time: ${formatTime(elapsedSeconds)}`);

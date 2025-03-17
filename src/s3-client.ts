@@ -10,7 +10,13 @@ import {
   DeleteObjectsCommand
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import type { Readable } from 'stream';
+import * as fs from 'fs';
+import * as fsExtra from 'fs-extra';
+import * as path from 'path';
+import { v4 as uuidv4 } from 'uuid';
 import type { S3Credentials } from './types';
+import { TransferMode } from './types';
 
 /**
  * Create an S3 client from credentials
@@ -93,13 +99,16 @@ export async function getObjectSize(
 
 /**
  * Download an object from S3 with progress tracking
+ * Can work in memory, disk or stream mode depending on the transferMode parameter
  */
 export async function downloadObject(
   client: S3Client,
   bucket: string,
   key: string,
-  onProgress?: (downloaded: number, total: number, speed: number) => void
-): Promise<Buffer> {
+  onProgress?: (downloaded: number, total: number, speed: number) => void,
+  transferMode: TransferMode = TransferMode.MEMORY,
+  tempDir?: string
+): Promise<Buffer | string | Readable> {
   const command = new GetObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -112,8 +121,88 @@ export async function downloadObject(
   }
 
   const contentLength = response.ContentLength || 0;
-  const responseBody = response.Body; // Store in a variable to avoid TS warnings
+  const responseBody = response.Body;
 
+  // If stream mode, return the readable stream directly
+  if (transferMode === TransferMode.STREAM) {
+    return responseBody as Readable;
+  }
+
+  // If disk mode, save to temporary file
+  if (transferMode === TransferMode.DISK) {
+    const tmpDir = tempDir || path.join(process.cwd(), 'tmp');
+
+    // Ensure temp directory exists
+    await fsExtra.ensureDir(tmpDir);
+
+    const tempFilePath = path.join(tmpDir, `${uuidv4()}-${path.basename(key)}`);
+
+    return new Promise<string>((resolve, reject) => {
+      try {
+        let lastReportTime = Date.now();
+        let lastReportedBytes = 0;
+        let downloadedBytes = 0;
+
+        // Create write stream to file
+        const fileStream = fs.createWriteStream(tempFilePath);
+        const readableStream = responseBody as Readable;
+
+        readableStream.on('data', (chunk) => {
+          downloadedBytes += chunk.length;
+
+          if (onProgress) {
+            const now = Date.now();
+            const timeDiff = now - lastReportTime;
+
+            // Update progress every 100ms
+            if (timeDiff >= 100) {
+              const byteDiff = downloadedBytes - lastReportedBytes;
+              const speed = byteDiff / (timeDiff / 1000); // bytes per second
+
+              onProgress(downloadedBytes, contentLength, speed);
+
+              lastReportTime = now;
+              lastReportedBytes = downloadedBytes;
+            }
+          }
+        });
+
+        readableStream.on('end', () => {
+          if (onProgress) {
+            onProgress(contentLength, contentLength, 0);
+          }
+        });
+
+        readableStream.on('error', (error) => {
+          // Clean up temp file on error
+          fs.unlink(tempFilePath, () => {
+            reject(error);
+          });
+        });
+
+        fileStream.on('error', (error) => {
+          // Clean up temp file on error
+          fs.unlink(tempFilePath, () => {
+            reject(error);
+          });
+        });
+
+        fileStream.on('finish', () => {
+          resolve(tempFilePath);
+        });
+
+        // Pipe stream to file
+        readableStream.pipe(fileStream);
+      } catch (error) {
+        // Clean up temp file on error
+        fs.unlink(tempFilePath, () => {
+          reject(error);
+        });
+      }
+    });
+  }
+
+  // Memory mode (default) - same as before
   // If no progress callback, just return the data directly
   if (!onProgress || contentLength <= 0) {
     const data = await responseBody.transformToByteArray();
@@ -170,15 +259,37 @@ export async function downloadObject(
 
 /**
  * Upload an object to S3 with progress tracking
+ * Can work with memory buffer, file path or stream depending on the input
  */
 export async function uploadObject(
   client: S3Client,
   bucket: string,
   key: string,
-  body: Buffer,
-  onProgress?: (uploaded: number, total: number, speed: number) => void
+  body: Buffer | string | Readable,
+  onProgress?: (uploaded: number, total: number, speed: number) => void,
+  removeSourceAfterUpload = false
 ): Promise<void> {
-  const totalBytes = body.length;
+  let uploadBody: Buffer | Readable;
+  let totalBytes: number;
+
+  // If body is a string, assume it's a file path
+  if (typeof body === 'string') {
+    totalBytes = fs.statSync(body).size;
+    uploadBody = fs.createReadStream(body);
+  }
+  // If body is a Buffer
+  else if (Buffer.isBuffer(body)) {
+    totalBytes = body.length;
+    uploadBody = body;
+  }
+  // If body is a Readable stream
+  else {
+    // For streams, we don't know the size in advance
+    // Set a large value for progress tracking
+    totalBytes = 1000000000; // 1GB default
+    uploadBody = body;
+  }
+
   let uploadedBytes = 0;
   let lastReportTime = Date.now();
   let lastReportedBytes = 0;
@@ -188,7 +299,7 @@ export async function uploadObject(
     params: {
       Bucket: bucket,
       Key: key,
-      Body: body,
+      Body: uploadBody,
     },
     queueSize: 4, // Adjust based on your needs
   });
@@ -221,6 +332,15 @@ export async function uploadObject(
   // Final progress report
   if (onProgress) {
     onProgress(totalBytes, totalBytes, 0);
+  }
+
+  // Remove source file if it's a file path and removeSourceAfterUpload is true
+  if (removeSourceAfterUpload && typeof body === 'string') {
+    try {
+      await fs.promises.unlink(body);
+    } catch (error) {
+      console.error(`Failed to remove temp file ${body}: ${(error as Error).message}`);
+    }
   }
 }
 
