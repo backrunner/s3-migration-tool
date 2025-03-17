@@ -3,4 +3,9 @@ module.exports = {
   env: {
     node: true,
   },
+  rules: {
+    complexity: 0,
+    'max-params': 0,
+    'no-console': 0,
+  },
 };

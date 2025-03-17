@@ -1,0 +1,52 @@
+# S3 Migration Configuration Example
+
+# Source bucket configuration
+source:
+  endpoint: "https://s3.amazonaws.com"
+  accessKey: "YOUR_SOURCE_ACCESS_KEY"
+  secretKey: "YOUR_SOURCE_SECRET_KEY"
+  region: "us-east-1"
+  bucket: "source-bucket-name"
+  # Optional: Use path style addressing (default: false)
+  forcePathStyle: false
+  # Optional: Use accelerate endpoint (default: false)
+  useAccelerateEndpoint: false
+
+# Target bucket configuration
+target:
+  endpoint: "https://storage.example.com"
+  accessKey: "YOUR_TARGET_ACCESS_KEY"
+  secretKey: "YOUR_TARGET_SECRET_KEY"
+  region: "eu-west-1"
+  bucket: "target-bucket-name"
+  forcePathStyle: true
+  useAccelerateEndpoint: false
+
+# Optional parameters
+# Number of concurrent transfers (default: 5)
+concurrency: 10
+
+# Maximum number of retry attempts for failed transfers (default: 3)
+maxRetries: 3
+
+# Only migrate objects with this prefix
+prefix: "data/"
+
+# Only include objects matching these patterns (regex)
+include:
+  - "\\.jpg$"
+  - "\\.png$"
+
+# Exclude objects matching these patterns (regex)
+exclude:
+  - "^temp/"
+  - "\\.tmp$"
+
+# Verify objects exist in target after migration (default: true)
+verifyAfterMigration: true
+
+# Delete objects from source after successful migration (default: false)
+purgeSourceAfterMigration: false
+
+# Dry run mode - no actual transfers (default: false)
+dryRun: false
