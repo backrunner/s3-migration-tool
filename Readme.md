@@ -10,6 +10,7 @@ A command-line tool for migrating objects between S3-compatible storage buckets.
 - Dry-run mode for testing without actual transfers
 - Colorful and informative progress display with real-time transfer speeds
 - File-level progress bars showing download and upload progress
+- Direct streaming mode for efficient large file transfers with minimal memory usage
 - Automatic retry for failed transfers with configurable retry limit
 - Interactive pause/resume/skip functionality for handling failures
 - Verification of migrated files to ensure successful transfer
@@ -37,16 +38,18 @@ s3-migrate <config-file> [options]
 - `-d, --dry-run`: Run in dry-run mode (no actual transfers)
 - `-c, --concurrency <number>`: Number of concurrent transfers
 - `-p, --prefix <prefix>`: Only migrate objects with this prefix
+- `-m, --mode <mode>`: Transfer mode (auto, memory, disk, or stream)
 - `-y, --yes`: Skip confirmation prompts and proceed with migration
 - `-v, --verbose`: Enable verbose logging with detailed error messages
 - `-l, --log-file <path>`: Save logs to the specified file
+- `--verify-content`: Verify file content after migration using checksums
 - `-V, --version`: Output the version number
 - `-h, --help`: Display help information
 
 ### Commands
 
 - `help [topic]`: Display detailed help information about specific topics
-  - Available topics: `config`, `filters`, `process`
+  - Available topics: `config`, `filters`, `process`, `transferModes`
 
 ### Examples
 
@@ -63,6 +66,12 @@ s3-migrate ./migration.yaml --concurrency 10
 # Only migrate objects with a specific prefix
 s3-migrate ./migration.yaml --prefix "images/"
 
+# Use stream transfer mode
+s3-migrate ./migration.yaml --mode stream
+
+# Enable content verification
+s3-migrate ./migration.yaml --verify-content
+
 # Skip confirmation prompts
 s3-migrate ./migration.yaml --yes
 
@@ -74,6 +83,9 @@ s3-migrate help config
 
 # Get detailed help on filtering options
 s3-migrate help filters
+
+# Get detailed help on transfer modes
+s3-migrate help transferModes
 ```
 
 ## Configuration
@@ -114,8 +126,11 @@ exclude:
   - '^temp/'
   - "\\.tmp$"
 verifyAfterMigration: true
+verifyFileContentAfterMigration: false
 purgeSourceAfterMigration: false
 dryRun: false
+# Transfer mode options
+transferMode: 'stream' # Choose from 'auto', 'memory', 'disk', or 'stream'
 ```
 
 ### Configuration Options
@@ -135,23 +150,67 @@ dryRun: false
 
 #### Migration Configuration Options
 
-| Option                      | Description                                             | Default  |
-| --------------------------- | ------------------------------------------------------- | -------- |
-| `source`                    | Source bucket configuration                             | Required |
-| `target`                    | Target bucket configuration                             | Required |
-| `concurrency`               | Number of concurrent transfers                          | 5        |
-| `maxRetries`                | Maximum number of retry attempts for failed transfers   | 3        |
-| `prefix`                    | Only migrate objects with this prefix (optional)        | None     |
-| `include`                   | Only include objects matching these patterns (optional) | None     |
-| `exclude`                   | Exclude objects matching these patterns (optional)      | None     |
-| `verifyAfterMigration`      | Verify objects exist in target after migration          | true     |
-| `purgeSourceAfterMigration` | Delete objects from source after successful migration   | false    |
-| `skipConfirmation`          | Skip confirmation prompts and proceed with migration    | false    |
-| `dryRun`                    | Run in dry-run mode (no actual transfers)               | false    |
-| `verbose`                   | Enable verbose logging with detailed error messages     | false    |
-| `logFile`                   | Save logs to the specified file                         | None     |
+| Option                            | Description                                             | Default  |
+| --------------------------------- | ------------------------------------------------------- | -------- |
+| `source`                          | Source bucket configuration                             | Required |
+| `target`                          | Target bucket configuration                             | Required |
+| `concurrency`                     | Number of concurrent transfers                          | 5        |
+| `maxRetries`                      | Maximum number of retry attempts for failed transfers   | 3        |
+| `prefix`                          | Only migrate objects with this prefix (optional)        | None     |
+| `include`                         | Only include objects matching these patterns (optional) | None     |
+| `exclude`                         | Exclude objects matching these patterns (optional)      | None     |
+| `verifyAfterMigration`            | Verify objects exist in target after migration          | true     |
+| `verifyFileContentAfterMigration` | Verify file content using checksums                     | false    |
+| `purgeSourceAfterMigration`       | Delete objects from source after successful migration   | false    |
+| `skipConfirmation`                | Skip confirmation prompts and proceed with migration    | false    |
+| `dryRun`                          | Run in dry-run mode (no actual transfers)               | false    |
+| `verbose`                         | Enable verbose logging with detailed error messages     | false    |
+| `logFile`                         | Save logs to the specified file                         | None     |
+| `transferMode`                    | File transfer mode (auto, memory, disk, stream)         | 'auto'   |
+| `tempDir`                         | Temporary file directory (for disk mode)                | './tmp'  |
+| `largeFileSizeThreshold`          | Threshold in bytes for large file detection             | 50% RAM  |
 
 See [example-config.yaml](./example-config.yaml) for a complete example.
+
+## Transfer Modes
+
+The CLI supports several transfer modes to optimize handling files of different sizes:
+
+### Stream Mode (Default)
+
+- Uses direct piping between source and target S3 buckets
+- Minimal memory usage - only buffers the current data chunk
+- Optimal for very large files or systems with limited memory
+- Shows real-time progress from 0-100% through the entire transfer process
+
+### Memory Mode
+
+- Loads the entire file into memory during transfer
+- Fastest for small to medium files
+- Not recommended for large files
+- Automatically switches to disk mode for files larger than 50% of available memory
+- Best for small files where speed is important
+
+### Disk Mode
+
+- Uses temporary files on disk as intermediate storage
+- Good balance between performance and memory usage
+- Suitable for files of any size
+- Requires sufficient disk space in the temp directory
+- Automatically switches to stream mode for very large files
+
+### Auto Mode
+
+- Automatically selects the best transfer mode based on file size
+- Uses memory mode for small files (< 50% of available memory)
+- Uses disk mode for medium files
+- Uses stream mode for very large files (> 80% of available memory)
+
+You can set the transfer mode in the config file:
+
+```yaml
+transferMode: 'stream' # Choose from 'auto', 'memory', 'disk', or 'stream'
+```
 
 ## Logging
 
@@ -162,19 +221,6 @@ When using the `logFile` option, the CLI will generate detailed logs of the migr
 - Detailed error information including stack traces (when available)
 - Status of each file's transfer, verification, and deletion
 - Summary information and statistics
-
-Log files are written in append mode, so multiple runs will add to the same log file rather than overwriting it. Each execution is clearly separated by a header that includes:
-
-```
-================================================================================
-== S3 MIGRATION EXECUTION STARTED AT 2023-04-25T12:34:56.789Z ==
-== Execution ID: 1682428496789-1234 ==
-== PID: 1234, User: johndoe ==
-== OS: darwin 20.6.0, Hostname: macbook-pro ==
-================================================================================
-```
-
-This makes it easy to track and analyze multiple migration runs in the same log file.
 
 ## Filtering Options
 
@@ -208,7 +254,10 @@ All filtering options are optional and can be used in combination. If both inclu
 The migration process follows these steps:
 
 1. **Listing**: List all objects in the source bucket (applying filters if specified)
-2. **Transfer**: Download objects from source and upload to target with progress tracking
+2. **Transfer**: Transfer objects from source to target with progress tracking
+   - Memory mode: Download entire file to memory, then upload to target
+   - Disk mode: Download to temporary file, then upload to target
+   - Stream mode: Direct pipe from source to target with minimal buffering
 3. **Verification**: Verify all migrated files exist in the target bucket
 4. **Summary**: Display a detailed summary of the migration
 5. **Retry**: Prompt to retry any failed transfers
@@ -230,6 +279,15 @@ When a file transfer fails:
 
 After all files are transferred, the tool will verify that each file exists in the target bucket.
 If any files fail verification, they will be marked as failed and you'll be prompted to retry them.
+
+### Content Verification
+
+When the `verifyFileContentAfterMigration` option is enabled (or the `--verify-content` flag is used),
+the tool performs an additional check by comparing file checksums (MD5 or ETag) between source and target.
+This ensures complete data integrity and detects any corruption that might have occurred during transfer.
+
+Content verification adds an extra level of assurance but may increase the total migration time as it
+requires retrieving metadata from both source and target buckets.
 
 ## Source Purge
 

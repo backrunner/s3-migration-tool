@@ -1,33 +1,49 @@
-import type { S3Client } from '@aws-sdk/client-s3';
+// Node.js built-in modules
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import type { Readable } from 'node:stream';
+
+// Third-party dependencies
 import chalk from 'chalk';
 import cliProgress from 'cli-progress';
-import ora from 'ora';
-import inquirer from 'inquirer';
-import * as os from 'os';
-import * as path from 'path';
-import * as fs from 'fs';
 import * as fsExtra from 'fs-extra';
-import type { MigrationConfig, FileTransfer } from './types';
-import { TransferStatus, TransferMode } from './types';
+import inquirer from 'inquirer';
+import ora from 'ora';
+import { v4 as uuidv4 } from 'uuid';
+
+// Local imports
 import {
+  abortMultipartUploadsForKeys,
+  calculateHash,
   createS3Client,
+  deleteObjects,
   downloadObject,
+  getObjectHash,
   getObjectSize,
   listAllObjects,
-  uploadObject,
+  listMultipartUploads,
   objectExists,
-  deleteObjects
+  streamObject,
+  uploadObject,
+  abortMultipartUpload,
 } from './s3-client';
 import {
   initLogger,
-  closeLogger,
   log,
+  LogLevel,
   logError,
-  logVerbose,
+  logSilent,
   logSuccess,
+  logVerbose,
   logWarning,
-  LogLevel
+  logInfo,
 } from './logger';
+import { TransferMode, TransferStatus } from './types';
+
+// Types
+import type { S3Client } from '@aws-sdk/client-s3';
+import type { FileTransfer, MigrationConfig } from './types';
 
 /**
  * Migration statistics
@@ -39,6 +55,7 @@ interface MigrationStats {
   failed: number;
   skipped: number;
   verificationFailed: number;
+  contentVerificationFailed: number;
   startTime: number;
   failedFiles: FileTransfer[];
   paused: boolean;
@@ -67,39 +84,1169 @@ function formatSpeed(bytesPerSecond: number): string {
 }
 
 /**
- * 获取系统可用内存（字节）
+ * Get system available memory (in bytes)
  */
 function getAvailableMemory(): number {
   return os.freemem();
 }
 
 /**
- * 自动确定文件传输模式
+ * Check and handle duplicate files in target bucket
  */
-function determineTransferMode(fileSize: number, config: MigrationConfig): TransferMode {
-  // 如果配置中已经指定了传输模式，则使用指定的模式
-  if (config.transferMode && config.transferMode !== TransferMode.AUTO) {
-    return config.transferMode;
+async function checkAndHandleDuplicateFiles(
+  targetClient: S3Client,
+  config: MigrationConfig,
+  transfers: FileTransfer[]
+): Promise<void> {
+  if (transfers.length === 0) {
+    return;
   }
 
-  // 获取可用内存
-  const availableMemory = getAvailableMemory();
-  // 大文件阈值，默认为可用内存的50%
-  const largeFileThreshold = config.largeFileSizeThreshold || (availableMemory * 0.5);
+  const spinner = ora('Checking for existing files in target bucket...').start();
 
-  // 如果文件小于阈值，使用内存模式
-  if (fileSize < largeFileThreshold) {
-    return TransferMode.MEMORY;
+  try {
+    // Get duplicate keys
+    const { allDuplicateKeys, completedFileKeys, multipartUploadKeys, multipartUploadData } = await findDuplicateKeys(targetClient, config.target.bucket, transfers, spinner);
+
+    // Handle duplicate files if any
+    if (allDuplicateKeys.length > 0) {
+      spinner.succeed(`Found ${chalk.bold(allDuplicateKeys.length.toString())} files that already exist in target bucket`);
+      logWarning(`Found ${allDuplicateKeys.length} files that already exist in target bucket`);
+
+      // Show sample of duplicate files
+      displayDuplicateSamples(allDuplicateKeys, completedFileKeys, multipartUploadKeys, multipartUploadData);
+
+      // Ask user for confirmation to delete files or skip them
+      const action = await confirmDeletion(allDuplicateKeys.length, completedFileKeys.length, multipartUploadKeys.length);
+
+      if (action === 'delete_all') {
+        await deleteDuplicateFiles(targetClient, config.target.bucket, allDuplicateKeys, 'all');
+      } else if (action === 'delete_multipart') {
+        await deleteDuplicateFiles(targetClient, config.target.bucket, multipartUploadKeys, 'multipart_only', multipartUploadData);
+      } else if (action === 'skip') {
+        // Mark all duplicate files as skipped
+        for (const file of transfers) {
+          if (allDuplicateKeys.includes(file.key)) {
+            file.status = TransferStatus.SKIPPED;
+            file.verified = false;
+            file.error = 'Duplicate file skipped during migration';
+          }
+        }
+        logVerbose(`Marked ${allDuplicateKeys.length} duplicate files to be skipped during migration`);
+      } else if (action === 'cancel') {
+        throw new Error('Migration cancelled by user due to duplicate files');
+      }
+    } else {
+      spinner.succeed('No duplicate files found in target bucket.');
+      logSuccess('No duplicate files found in target bucket.');
+    }
+  } catch (error) {
+    spinner.fail(`Error checking target bucket: ${(error as Error).message}`);
+    logError('Error checking duplicate files in target bucket', error as Error);
+
+    // Ask user if they want to continue
+    const { continueAnyway } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'continueAnyway',
+        message: 'Failed to check for duplicate files in target bucket. Do you want to continue anyway?',
+        default: false
+      }
+    ]);
+
+    if (!continueAnyway) {
+      throw new Error('Migration cancelled due to error checking target bucket');
+    }
+  }
+}
+
+/**
+ * Find keys that exist in both source and target
+ */
+async function findDuplicateKeys(
+  targetClient: S3Client,
+  targetBucket: string,
+  transfers: FileTransfer[],
+  spinner: any
+): Promise<{
+  allDuplicateKeys: string[];
+  completedFileKeys: string[];
+  multipartUploadKeys: string[];
+  multipartUploadData: Array<{ Key: string; UploadId: string; Initiated?: Date }>
+}> {
+  // Get a list of all source file keys
+  const sourceKeys = transfers.map(t => t.key);
+
+  // Store keys that exist in target bucket
+  const allDuplicateKeys: string[] = [];
+  const completedFileKeys: string[] = [];
+  const multipartUploadKeys: string[] = [];
+  let multipartUploadData: Array<{ Key: string; UploadId: string; Initiated?: Date }> = [];
+
+  // Get any in-progress multipart uploads for these keys
+  try {
+    const inProgressUploads = await listMultipartUploads(targetClient, targetBucket);
+
+    // Create a map for faster lookup
+    const inProgressKeys = new Set(inProgressUploads.map(upload => upload.Key));
+
+    logVerbose(`Found ${inProgressUploads.length} in-progress multipart uploads in target bucket`);
+
+    // Find multipart duplicates
+    const multipartDuplicates = sourceKeys.filter(key => inProgressKeys.has(key));
+    if (multipartDuplicates.length > 0) {
+      logVerbose(`Found ${multipartDuplicates.length} files with in-progress multipart uploads that match source files`);
+      multipartUploadKeys.push(...multipartDuplicates);
+      allDuplicateKeys.push(...multipartDuplicates);
+
+      // Store multipart upload data for these keys
+      multipartUploadData = inProgressUploads.filter(upload =>
+        multipartDuplicates.includes(upload.Key));
+    }
+  } catch (error) {
+    logWarning(`Error checking for in-progress multipart uploads: ${(error as Error).message}`);
+    // Continue with the normal object existence checks
   }
 
-  // 文件很大（接近或超过可用内存），使用磁盘或流模式
-  // 如果文件大于可用内存的95%，建议使用流模式
-  if (fileSize > availableMemory * 0.95) {
+  // Check in batches to avoid overwhelming the target S3 service
+  const batchSize = 100;
+  for (let i = 0; i < sourceKeys.length; i += batchSize) {
+    const batch = sourceKeys.slice(i, Math.min(i + batchSize, sourceKeys.length));
+
+    // Check each key in the batch
+    await Promise.all(batch.map(async (key) => {
+      try {
+        const exists = await objectExists(targetClient, targetBucket, key);
+        if (exists) {
+          // Skip already counted multipart uploads to avoid double counting
+          if (!multipartUploadKeys.includes(key)) {
+            completedFileKeys.push(key);
+            allDuplicateKeys.push(key);
+          }
+        }
+      } catch (error) {
+        logError(`Error checking if object exists in target: ${key}`, error as Error);
+      }
+    }));
+
+    // Update spinner to show progress
+    spinner.text = `Checking for existing files in target bucket (${Math.min(i + batchSize, sourceKeys.length)}/${sourceKeys.length})...`;
+  }
+
+  return {
+    allDuplicateKeys,
+    completedFileKeys,
+    multipartUploadKeys,
+    multipartUploadData
+  };
+}
+
+/**
+ * Display samples of duplicate files
+ */
+function displayDuplicateSamples(
+  allDuplicateKeys: string[],
+  completedFileKeys: string[],
+  multipartUploadKeys: string[],
+  multipartUploadData: Array<{ Key: string; UploadId: string; Initiated?: Date }>
+): void {
+  // Show sample of all duplicate files (first 10)
+  logInfo('\nDuplicate files in target bucket (showing first 10):', chalk.cyan);
+  const samplesToShow = Math.min(allDuplicateKeys.length, 10);
+  for (let i = 0; i < samplesToShow; i++) {
+    const key = allDuplicateKeys[i];
+    const isMultipart = multipartUploadKeys.includes(key);
+    const label = isMultipart ? '[incomplete upload]' : '[completed file]';
+
+    // For multipart uploads, show when it was initiated if available
+    if (isMultipart) {
+      const uploadInfo = multipartUploadData.find(u => u.Key === key);
+      if (uploadInfo?.Initiated) {
+        const date = uploadInfo.Initiated.toISOString().split('T')[0];
+        logInfo(`  - ${key} ${chalk.yellow(label)} (started: ${date})`, chalk.white);
+      } else {
+        logInfo(`  - ${key} ${chalk.yellow(label)}`, chalk.white);
+      }
+    } else {
+      logInfo(`  - ${key} ${chalk.blue(label)}`, chalk.white);
+    }
+  }
+
+  if (allDuplicateKeys.length > 10) {
+    logInfo(`  ... and ${allDuplicateKeys.length - 10} more files`, chalk.white);
+  }
+  logInfo('', chalk.white);
+}
+
+/**
+ * Ask user for confirmation to delete files or skip them
+ * Returns:
+ * - "delete_all" if user wants to delete all files
+ * - "delete_multipart" if user wants to delete only incomplete multipart uploads
+ * - "skip" if user wants to skip them
+ * - "cancel" to cancel migration
+ */
+async function confirmDeletion(
+  totalCount: number,
+  completedFilesCount: number,
+  multipartUploadsCount: number
+): Promise<"delete_all" | "delete_multipart" | "skip" | "cancel"> {
+  // Show detailed counts
+  logInfo(`Found ${chalk.bold(totalCount.toString())} files in target bucket:`, chalk.white);
+  logInfo(`  - ${chalk.bold(completedFilesCount.toString())} completed files`, chalk.white);
+  logInfo(`  - ${chalk.bold(multipartUploadsCount.toString())} incomplete multipart uploads`, chalk.white);
+  logInfo('', chalk.white);
+
+  // Ask user what to do with duplicate files
+  const { action } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'action',
+      message: `What would you like to do with these existing files?`,
+      choices: [
+        { name: 'Skip these files (continue migration without them)', value: 'skip' },
+        { name: 'Delete ALL files from target bucket before migration', value: 'delete_all' },
+        { name: 'Delete ONLY incomplete multipart uploads (keep completed files)', value: 'delete_multipart' },
+        { name: 'Cancel migration', value: 'cancel' }
+      ]
+    }
+  ]);
+
+  if (action === 'cancel') {
+    logWarning('Migration cancelled by user.');
+    return 'cancel';
+  }
+
+  if (action === 'skip') {
+    logWarning(`Will skip ${totalCount} duplicate files during migration.`);
+    return 'skip';
+  }
+
+  if (action === 'delete_multipart') {
+    if (multipartUploadsCount === 0) {
+      logInfo('No incomplete multipart uploads to delete.', chalk.white);
+
+      // Ask again with reduced options if there are no multipart uploads
+      if (completedFilesCount > 0) {
+        const { secondAction } = await inquirer.prompt([
+          {
+            type: 'list',
+            name: 'secondAction',
+            message: 'There are no incomplete uploads, only completed files. What would you like to do?',
+            choices: [
+              { name: 'Skip these files (continue migration without them)', value: 'skip' },
+              { name: 'Delete ALL files from target bucket before migration', value: 'delete_all' },
+              { name: 'Cancel migration', value: 'cancel' }
+            ]
+          }
+        ]);
+
+        if (secondAction === 'skip') return 'skip';
+        if (secondAction === 'cancel') {
+          logWarning('Migration cancelled by user.');
+          return 'cancel';
+        }
+        if (secondAction === 'delete_all') return 'delete_all';
+      } else {
+        // Nothing to delete, return skip
+        return 'skip';
+      }
+    } else {
+      logWarning(`Will delete ${multipartUploadsCount} incomplete multipart uploads.`);
+      return 'delete_multipart';
+    }
+  }
+
+  // Double confirm for safety if user chose to delete all
+  if (action === 'delete_all') {
+    const { confirmDeleteAgain } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirmDeleteAgain',
+        message: chalk.red.bold(`WARNING: This will DELETE ${totalCount} files from the target bucket. Are you ABSOLUTELY sure?`),
+        default: false
+      }
+    ]);
+
+    if (!confirmDeleteAgain) {
+      logWarning('Deletion cancelled. What would you like to do instead?');
+      // Ask again with reduced options
+      const { secondAction } = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'secondAction',
+          message: 'Please choose an alternative action:',
+          choices: [
+            { name: 'Skip these files (continue migration without them)', value: 'skip' },
+            { name: 'Delete ONLY incomplete multipart uploads', value: 'delete_multipart' },
+            { name: 'Cancel migration', value: 'cancel' }
+          ]
+        }
+      ]);
+
+      if (secondAction === 'cancel') {
+        logWarning('Migration cancelled by user.');
+        return 'cancel';
+      } else if (secondAction === 'skip') {
+        logWarning(`Will skip ${totalCount} duplicate files during migration.`);
+        return 'skip';
+      } else if (secondAction === 'delete_multipart') {
+        if (multipartUploadsCount === 0) {
+          logWarning('No incomplete multipart uploads to delete.');
+          return 'skip'; // Skip if there are no multipart uploads
+        }
+        logWarning(`Will delete ${multipartUploadsCount} incomplete multipart uploads.`);
+        return 'delete_multipart';
+      }
+    }
+
+    return 'delete_all';
+  }
+
+  return 'skip'; // Default fallback (should never reach here)
+}
+
+/**
+ * Delete duplicate files from target bucket
+ */
+async function deleteDuplicateFiles(
+  targetClient: S3Client,
+  targetBucket: string,
+  duplicateKeys: string[],
+  deleteMode: 'all' | 'multipart_only' = 'all',
+  multipartUploadData?: Array<{ Key: string; UploadId: string; Initiated?: Date }>
+): Promise<void> {
+  // Create a progress bar for deletion
+  const progressBar = new cliProgress.SingleBar({
+    format: ' {bar} | {percentage}% | {value}/{total} | Deleting files from target bucket',
+    clearOnComplete: false,
+    hideCursor: true,
+  }, cliProgress.Presets.shades_grey);
+
+  progressBar.start(duplicateKeys.length, 0);
+
+  // First, abort any in-progress multipart uploads for these keys
+  logVerbose(`Checking for in-progress multipart uploads for ${duplicateKeys.length} files...`);
+
+  try {
+    // If we're only deleting multipart uploads and have the data already, use it directly
+    if (deleteMode === 'multipart_only' && multipartUploadData && multipartUploadData.length > 0) {
+      // Abort each upload individually with its upload ID
+      let aborted = 0;
+      let failed = 0;
+
+      for (const upload of multipartUploadData) {
+        try {
+          const success = await abortMultipartUpload(
+            targetClient,
+            targetBucket,
+            upload.Key,
+            upload.UploadId
+          );
+
+          if (success) {
+            aborted++;
+          } else {
+            failed++;
+          }
+          progressBar.update(aborted + failed);
+        } catch (error) {
+          failed++;
+          progressBar.update(aborted + failed);
+          logError(`Failed to abort multipart upload for ${upload.Key}: ${(error as Error).message}`);
+        }
+      }
+
+      progressBar.stop();
+
+      if (failed > 0) {
+        logWarning(`\nAborted ${aborted} incomplete multipart uploads, ${failed} failed to abort.`);
+      } else {
+        logSuccess(`\nSuccessfully aborted ${aborted} incomplete multipart uploads.`);
+      }
+
+      return; // Exit early if we're only handling multipart uploads
+    } else {
+      // Default behavior - call the bulk API
+      const multipartResult = await abortMultipartUploadsForKeys(
+        targetClient,
+        targetBucket,
+        duplicateKeys
+      );
+
+      if (multipartResult.totalFound > 0) {
+        logVerbose(`Found and aborted ${multipartResult.aborted} in-progress multipart uploads for duplicate files. ${multipartResult.failed} failed to abort.`);
+      } else {
+        logVerbose('No in-progress multipart uploads found for duplicate files.');
+      }
+    }
+  } catch (error) {
+    logWarning(`Error handling in-progress multipart uploads: ${(error as Error).message}`);
+    // Continue with deletion even if this fails
+  }
+
+  // If we're only deleting multipart uploads, we're done
+  if (deleteMode === 'multipart_only') {
+    progressBar.stop();
+    return;
+  }
+
+  // Delete complete files in batches
+  let deleted = 0;
+  let failed = 0;
+  const failedKeys: string[] = [];
+
+  // Process in batches of 1000 (S3 limitation)
+  const deleteBatchSize = 1000;
+  for (let i = 0; i < duplicateKeys.length; i += deleteBatchSize) {
+    const batch = duplicateKeys.slice(i, i + deleteBatchSize);
+
+    try {
+      const result = await deleteObjects(targetClient, targetBucket, batch);
+      deleted += result.deleted.length;
+      failed += result.failed.length;
+
+      if (result.failed.length > 0) {
+        failedKeys.push(...result.failed);
+      }
+
+      progressBar.update(i + batch.length);
+    } catch (error) {
+      failed += batch.length;
+      failedKeys.push(...batch);
+      logError(`Error deleting objects from target bucket: ${(error as Error).message}`);
+    }
+  }
+
+  progressBar.stop();
+
+  // Show results
+  if (failed > 0) {
+    logWarning(`\nDeleted ${deleted} files from target bucket, ${failed} deletions failed.`);
+    log(LogLevel.WARNING, 'Failed to delete the following files:', false);
+
+    for (const key of failedKeys) {
+      log(LogLevel.ERROR, `  - ${key}`, false);
+    }
+  } else {
+    logSuccess(`\nSuccessfully deleted ${deleted} files from target bucket.`);
+  }
+}
+
+/**
+ * Determine the optimal transfer mode based on file characteristics and system resources
+ * @param fileSize File size in bytes
+ * @param fileKey File key/path
+ * @param availableMemory Available system memory in bytes
+ * @returns The recommended TransferMode
+ */
+function determineOptimalTransferMode(
+  fileSize: number,
+  fileKey: string,
+  availableMemory: number
+): TransferMode {
+  // If file size not known, default to STREAM mode as it's safest
+  if (!fileSize || fileSize <= 0) {
+    logVerbose(`File size unknown for ${fileKey}, defaulting to STREAM mode`);
     return TransferMode.STREAM;
   }
 
-  // 否则使用磁盘模式
-  return TransferMode.DISK;
+  // 1. Check file extension for format-specific optimizations
+  const fileExt = path.extname(fileKey).toLowerCase();
+  const compressedFormats = ['.zip', '.gz', '.bz2', '.tar', '.rar', '.7z', '.xz'];
+  const imageFormats = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff'];
+  const textFormats = ['.txt', '.csv', '.json', '.xml', '.html', '.md', '.log'];
+
+  // 2. Define size thresholds (dynamic based on available memory)
+  const smallFileThreshold = Math.min(5 * 1024 * 1024, availableMemory * 0.1); // 5MB or 10% of RAM, whichever is smaller
+  const mediumFileThreshold = Math.min(100 * 1024 * 1024, availableMemory * 0.3); // 100MB or 30% of RAM, whichever is smaller
+  const largeFileThreshold = Math.min(500 * 1024 * 1024, availableMemory * 0.5); // 500MB or 50% of RAM, whichever is smaller
+
+  // 3. Format-specific behaviors combined with size
+  // Smallest files - use memory mode for fastest transfer
+  if (fileSize < smallFileThreshold) {
+    // For text formats (typically highly compressible), memory mode is generally best for small files
+    if (textFormats.includes(fileExt)) {
+      logVerbose(`Small text file (${formatBytes(fileSize)}) detected for ${fileKey}, using MEMORY mode for optimization`);
+      return TransferMode.MEMORY;
+    }
+
+    // For small images, memory mode is usually efficient
+    if (imageFormats.includes(fileExt)) {
+      logVerbose(`Small image file (${formatBytes(fileSize)}) detected for ${fileKey}, using MEMORY mode for optimization`);
+      return TransferMode.MEMORY;
+    }
+
+    // For all other small files, use memory mode
+    logVerbose(`Small file (${formatBytes(fileSize)}) detected for ${fileKey}, using MEMORY mode`);
+    return TransferMode.MEMORY;
+  }
+
+  // Medium files - balance between performance and resource usage
+  if (fileSize < mediumFileThreshold) {
+    // For compressed formats in medium size, prefer STREAM mode to avoid double compression/decompression
+    if (compressedFormats.includes(fileExt)) {
+      logVerbose(`Medium compressed file (${formatBytes(fileSize)}) detected for ${fileKey}, using STREAM mode to avoid unnecessary decompression`);
+      return TransferMode.STREAM;
+    }
+
+    // For medium size images, disk mode is usually a good balance
+    if (imageFormats.includes(fileExt)) {
+      logVerbose(`Medium image file (${formatBytes(fileSize)}) detected for ${fileKey}, using DISK mode for balance`);
+      return TransferMode.DISK;
+    }
+
+    // For other medium files, disk mode offers good balance
+    logVerbose(`Medium file (${formatBytes(fileSize)}) detected for ${fileKey}, using DISK mode for balance of performance and memory`);
+    return TransferMode.DISK;
+  }
+
+  // Large files - conserve memory
+  if (fileSize < largeFileThreshold) {
+    // All large files usually benefit from DISK mode
+    logVerbose(`Large file (${formatBytes(fileSize)}) detected for ${fileKey}, using DISK mode to conserve memory`);
+    return TransferMode.DISK;
+  }
+
+  // Very large files - always use STREAM mode
+  logVerbose(`Very large file (${formatBytes(fileSize)}) detected for ${fileKey}, using STREAM mode to minimize memory usage`);
+  return TransferMode.STREAM;
+}
+
+/**
+ * Process a single object
+ */
+async function processObject(
+  sourceClient: S3Client,
+  targetClient: S3Client,
+  config: MigrationConfig,
+  transfer: FileTransfer,
+  progressBar: cliProgress.SingleBar,
+  stats: MigrationStats,
+  maxRetries: number
+): Promise<void> {
+  // Skip if already processed
+  if (
+    transfer.status === TransferStatus.SUCCEEDED ||
+    transfer.status === TransferStatus.SKIPPED
+  ) {
+    return;
+  }
+
+  // Skip if in dry run mode
+  if (config.dryRun) {
+    transfer.status = TransferStatus.SKIPPED;
+    progressBar.update(100, {
+      status: chalk.yellow('Skipped (dry run)'),
+      speed: ''
+    });
+    stats.skipped++;
+    logVerbose(`Skipped file in dry run mode: ${transfer.key}`);
+    return;
+  }
+
+  try {
+    // First, respect user's global config if specified
+    if (config.transferMode && config.transferMode !== TransferMode.AUTO && !transfer.transferMode) {
+      // Apply the user's globally specified transfer mode to this file
+      transfer.transferMode = config.transferMode;
+      logVerbose(`Using user-specified ${transfer.transferMode} mode for ${transfer.key}`);
+    }
+
+    // If no mode specified yet or auto mode, determine the best mode
+    if (!transfer.transferMode || transfer.transferMode === TransferMode.AUTO) {
+      // Apply the intelligent mode selection algorithm
+      const availableMemory = getAvailableMemory();
+      transfer.transferMode = determineOptimalTransferMode(
+        transfer.size || 0,
+        transfer.key,
+        availableMemory
+      );
+
+      logVerbose(`Auto-selected ${transfer.transferMode} mode for ${transfer.key} based on file characteristics`);
+
+      // Safety check - for very large files relative to memory, always use STREAM mode
+      if (transfer.size && transfer.size > availableMemory * 0.8 && transfer.transferMode !== TransferMode.STREAM) {
+        logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large relative to available memory (${formatBytes(availableMemory)}), overriding to STREAM mode`);
+        transfer.transferMode = TransferMode.STREAM;
+      }
+    }
+
+    // Resource-based safety checks for all modes (including user-specified modes)
+    // These will only change the mode if there are resource constraints
+
+    // Create temp directory if needed for disk or memory mode (that could fallback to disk)
+    let tempDir = config.tempDir;
+    if ((transfer.transferMode === TransferMode.DISK || transfer.transferMode === TransferMode.MEMORY) && !tempDir) {
+      tempDir = path.join(process.cwd(), 'tmp');
+      await fsExtra.ensureDir(tempDir);
+    }
+
+    // Check if memory mode is suitable for this file's size
+    if (transfer.transferMode === TransferMode.MEMORY && transfer.size) {
+      const availableMemory = os.freemem();
+
+      // If file is larger than 50% of available memory, switch to disk mode
+      if (transfer.size > availableMemory * 0.5) {
+        logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large for memory mode, switching to disk mode`);
+        transfer.transferMode = TransferMode.DISK;
+      }
+    }
+
+    // Check if disk mode is suitable for this file's size
+    if (transfer.transferMode === TransferMode.DISK && transfer.size) {
+      const availableMemory = os.freemem();
+
+      // If file is larger than 80% of available memory, switch to stream mode
+      if (transfer.size > availableMemory * 0.8) {
+        logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large for disk mode, switching to stream mode`);
+        transfer.transferMode = TransferMode.STREAM;
+      }
+    }
+
+    const isStreamMode = transfer.transferMode === TransferMode.STREAM;
+
+    // Calculate source hash if content verification is enabled and not in stream mode
+    // For stream mode, we'll handle differently since we don't store the entire file locally
+    if (config.verifyFileContentAfterMigration && !isStreamMode) {
+      try {
+        progressBar.update(0, {
+          status: chalk.blue(`Calculating source hash`),
+          speed: ''
+        });
+
+        // Calculate hash of source object
+        transfer.sourceHash = await getObjectHash(
+          sourceClient,
+          config.source.bucket,
+          transfer.key,
+          'md5',
+          tempDir
+        );
+
+        logVerbose(`Source hash for ${transfer.key}: ${transfer.sourceHash}`);
+      } catch (error) {
+        logWarning(`Failed to calculate source hash for ${transfer.key}: ${(error as Error).message}`);
+        logWarning(`Content verification will be skipped for this file`);
+      }
+    }
+
+    // For stream mode, use the streamObject function that transfers directly
+    if (isStreamMode) {
+      progressBar.update(0, {
+        status: chalk.blue(`Streaming`),
+        speed: ''
+      });
+
+      transfer.status = TransferStatus.STREAMING;
+      logVerbose(`Starting streaming transfer of ${transfer.key} using direct pipe mode`);
+
+      // Use the direct streaming method
+      await streamObject(
+        sourceClient,
+        targetClient,
+        config.source.bucket,
+        config.target.bucket,
+        transfer.key,
+        transfer.key,
+        (transferred, total, speed) => {
+          transfer.downloadSpeed = speed; // Using download speed for the entire transfer
+
+          // For stream mode, progress spans from 0-100% in one operation
+          const progress = Math.floor((transferred / total) * 100);
+          transfer.progress = progress;
+
+          // Check if transfer is stalled (speed = 0)
+          if (speed === 0) {
+            progressBar.update(progress, {
+              status: chalk.yellow(`Stalled`),
+              speed: chalk.red(`STALLED`)
+            });
+            logSilent(`Stream transfer appears to be stalled for ${transfer.key} at ${progress}%`);
+          } else {
+            progressBar.update(progress, {
+              status: chalk.blue(`Direct Streaming`),
+              speed: formatSpeed(speed)
+            });
+          }
+        },
+        maxRetries,  // Pass maximum retry count
+        // Based on file size, choose fallback mode
+        transfer.size && transfer.size < getAvailableMemory() * 0.2
+          ? TransferMode.MEMORY   // Memory mode for smaller files
+          : TransferMode.DISK,    // Disk mode for larger files
+        // Pass temp directory
+        config.tempDir || path.join(process.cwd(), 'tmp'),
+        2                         // Try fallback after 2 failures
+      );
+
+      // Mark as succeeded
+      transfer.status = TransferStatus.SUCCEEDED;
+      const finalSpeedInfo = transfer.downloadSpeed ? formatSpeed(transfer.downloadSpeed) : 'N/A';
+
+      progressBar.update(100, {
+        status: chalk.green('Stream Completed'),
+        speed: finalSpeedInfo
+      });
+      stats.succeeded++;
+
+      // Verify content hash if enabled for stream mode
+      if (config.verifyFileContentAfterMigration) {
+        try {
+          progressBar.update(100, {
+            status: chalk.blue(`Verifying content`),
+            speed: ''
+          });
+
+          // Calculate hash of source and target objects
+          logVerbose(`Calculating source hash for ${transfer.key} after streaming`);
+          transfer.sourceHash = await getObjectHash(
+            sourceClient,
+            config.source.bucket,
+            transfer.key,
+            'md5',
+            tempDir
+          );
+
+          logVerbose(`Calculating target hash for ${transfer.key} after streaming`);
+          transfer.targetHash = await getObjectHash(
+            targetClient,
+            config.target.bucket,
+            transfer.key,
+            'md5',
+            tempDir
+          );
+
+          // Compare hashes
+          if (transfer.sourceHash === transfer.targetHash) {
+            transfer.contentVerified = true;
+            progressBar.update(100, {
+              status: chalk.green('Content Verified'),
+              speed: finalSpeedInfo
+            });
+            logSuccess(`Content verified for ${transfer.key}: ${transfer.sourceHash}`);
+          } else {
+            transfer.contentVerified = false;
+            transfer.status = TransferStatus.CONTENT_VERIFICATION_FAILED;
+            stats.succeeded--;
+            stats.contentVerificationFailed++;
+            stats.failedFiles.push(transfer);
+
+            progressBar.update(100, {
+              status: chalk.red('Content Verification Failed'),
+              speed: finalSpeedInfo
+            });
+
+            logError(`Content verification failed for ${transfer.key}`);
+            logError(`Source hash: ${transfer.sourceHash}`);
+            logError(`Target hash: ${transfer.targetHash}`);
+          }
+        } catch (error) {
+          logWarning(`Failed to verify content for ${transfer.key}: ${(error as Error).message}`);
+        }
+      }
+
+      // Record transfer mode
+      if (!stats.transfersByMode) {
+        stats.transfersByMode = [];
+      }
+      stats.transfersByMode.push({ ...transfer });
+
+      logSuccess(`Successfully streamed: ${transfer.key} using direct pipe mode`);
+      return;
+    }
+
+    // The rest of the code for non-stream modes
+    progressBar.update(0, {
+      status: chalk.blue(`Downloading`),
+      speed: ''
+    });
+
+    // Download from source
+    transfer.status = TransferStatus.DOWNLOADING;
+    logVerbose(`Starting download of ${transfer.key} using ${transfer.transferMode} mode`);
+
+    const data = await downloadObject(
+      sourceClient,
+      config.source.bucket,
+      transfer.key,
+      (downloaded, total, speed) => {
+        transfer.downloadSpeed = speed;
+
+        // For memory/disk mode, use the main progress bar for download (0-100%)
+        const progress = Math.floor((downloaded / total) * 100);
+
+        // Check if download is stalled (speed = 0)
+        if (speed === 0) {
+          progressBar.update(progress, {
+            status: chalk.yellow(`Download Stalled`),
+            speed: chalk.red(`STALLED`)
+          });
+          logSilent(`Download appears to be stalled for ${transfer.key} at ${progress}%`);
+        } else {
+          progressBar.update(progress, {
+            status: chalk.blue(`Downloading`),
+            speed: formatSpeed(speed)
+          });
+        }
+      },
+      transfer.transferMode,
+      tempDir
+    );
+
+    // For content verification in memory/disk mode, we can calculate hash during download
+    // if we didn't already calculate it
+    if (config.verifyFileContentAfterMigration && !transfer.sourceHash) {
+      try {
+        progressBar.update(100, {
+          status: chalk.blue(`Calculating source hash`),
+          speed: ''
+        });
+
+        // Calculate hash from the downloaded data
+        transfer.sourceHash = await calculateHash(data as string | Buffer | Readable);
+        logVerbose(`Source hash for ${transfer.key}: ${transfer.sourceHash}`);
+      } catch (error) {
+        logWarning(`Failed to calculate source hash for ${transfer.key}: ${(error as Error).message}`);
+        logWarning(`Content verification will be skipped for this file`);
+      }
+    }
+
+    // Output debug info about the downloaded data
+    logVerbose(`Download completed for ${transfer.key}`);
+    logVerbose(`Data type received from downloadObject: ${typeof data}`);
+    if (typeof data === 'string') {
+      logVerbose(`Disk mode - file path: ${data}`);
+    } else if (Buffer.isBuffer(data)) {
+      logVerbose(`Memory mode - buffer size: ${formatBytes(data.length)}`);
+    } else {
+      logVerbose(`Stream mode - using data stream`);
+    }
+
+    // Calculate average download speed if available
+    const avgSpeed = transfer.downloadSpeed ? formatSpeed(transfer.downloadSpeed) : 'N/A';
+
+    progressBar.update(100, {
+      status: chalk.green('Download Complete'),
+      speed: avgSpeed
+    });
+
+    // Log that we're transitioning to upload
+    logVerbose(`Download complete for ${transfer.key}, preparing for upload using ${transfer.transferMode} mode`);
+
+    // Now update the bar for upload phase
+    progressBar.update(0, {
+      status: chalk.blue(`Uploading`),
+      speed: ''
+    });
+
+    // Log before starting upload
+    logVerbose(`Starting upload for ${transfer.key}...`);
+
+    // Upload to target
+    transfer.status = TransferStatus.UPLOADING;
+    logVerbose(`Starting upload of ${transfer.key} to target using ${transfer.transferMode} mode`);
+
+    // Store temp file path for disk mode
+    if (typeof data === 'string') {
+      transfer.tempFilePath = data;
+      logVerbose(`Using temporary file for upload: ${transfer.tempFilePath}`);
+    } else if (Buffer.isBuffer(data)) {
+      logVerbose(`Using memory buffer for upload, size: ${formatBytes(data.length)}`);
+    } else {
+      logVerbose(`Using stream for upload`);
+    }
+
+    try {
+      // Add debug information
+      logVerbose(`Calling uploadObject with data type: ${typeof data}, transfer mode: ${transfer.transferMode}`);
+
+      // For file paths, verify existence
+      if (typeof data === 'string') {
+        logVerbose(`File path exists check: ${fs.existsSync(data)}`);
+        try {
+          const stats = fs.statSync(data);
+          logVerbose(`File size on disk: ${formatBytes(stats.size)}`);
+        } catch (err) {
+          logError(`Error checking file stats: ${(err as Error).message}`);
+        }
+      }
+
+      logVerbose(`Target bucket: ${config.target.bucket}, key: ${transfer.key}`);
+      logVerbose(`Starting upload with AWS S3 client endpoint: ${config.target.endpoint}`);
+
+      // Delete temp file after upload only for disk mode
+      const shouldDeleteTempFile = transfer.transferMode === TransferMode.DISK;
+
+      await uploadObject(
+        targetClient,
+        config.target.bucket,
+        transfer.key,
+        data,
+        (uploaded, total, speed) => {
+          transfer.uploadSpeed = speed;
+
+          // Use the main progress bar for upload progress (0-100%)
+          const progress = Math.floor((uploaded / total) * 100);
+
+          // Check if upload is stalled (speed = 0)
+          if (speed === 0) {
+            progressBar.update(progress, {
+              status: chalk.yellow(`Upload Stalled`),
+              speed: chalk.red(`STALLED`)
+            });
+          } else {
+            progressBar.update(progress, {
+              status: chalk.blue(`Uploading`),
+              speed: formatSpeed(speed)
+            });
+          }
+
+          // Add detailed logs
+          if (progress % 10 === 0 || speed === 0) { // Log every 10% and when stalled
+            if (speed === 0) {
+              logSilent(`Upload appears to be stalled for ${transfer.key} at ${progress}%`);
+            } else {
+              logVerbose(`Upload progress for ${transfer.key}: ${progress}%, ${formatBytes(uploaded)}/${formatBytes(total)} at ${formatSpeed(speed)}`);
+            }
+          }
+        },
+        shouldDeleteTempFile,
+        transfer.transferMode
+      );
+    } catch (error) {
+      // Handle error based on transfer mode
+      if (transfer.transferMode === TransferMode.MEMORY && (error as Error).message.includes('memory')) {
+        logWarning(`Memory mode failed for upload: ${(error as Error).message}`);
+        logWarning(`Switching to disk mode for ${transfer.key}`);
+        logVerbose(`This is an automatic downgrade due to memory constraints, not counted as a retry`);
+
+        // Switch to disk mode
+        transfer.transferMode = TransferMode.DISK;
+
+        // Ensure temp directory exists
+        if (!tempDir) {
+          tempDir = path.join(process.cwd(), 'tmp');
+          await fsExtra.ensureDir(tempDir);
+        }
+
+        // If data is a Buffer, save it to a temporary file first
+        if (Buffer.isBuffer(data)) {
+          const tempFilePath = path.join(tempDir, `${uuidv4()}-${path.basename(transfer.key)}`);
+          await fs.promises.writeFile(tempFilePath, data);
+          transfer.tempFilePath = tempFilePath;
+
+          // Update the progress bar for retry
+          progressBar.update(0, {
+            status: chalk.blue(`Uploading (disk - retry)`),
+            speed: ''
+          });
+
+          logVerbose(`Retrying upload using disk mode with temporary file: ${tempFilePath}`);
+
+          // Use the temporary file for upload
+          await uploadObject(
+            targetClient,
+            config.target.bucket,
+            transfer.key,
+            tempFilePath,
+            (uploaded, total, speed) => {
+              transfer.uploadSpeed = speed;
+
+              const progress = Math.floor((uploaded / total) * 100);
+
+              // Check if retry upload is stalled
+              if (speed === 0) {
+                progressBar.update(progress, {
+                  status: chalk.yellow(`Retry Upload Stalled`),
+                  speed: chalk.red(`STALLED`)
+                });
+                logSilent(`Retry upload appears to be stalled for ${transfer.key} at ${progress}%`);
+              } else {
+                progressBar.update(progress, {
+                  status: chalk.blue(`Uploading (disk - retry)`),
+                  speed: formatSpeed(speed)
+                });
+              }
+            },
+            true, // Delete the temporary file after upload
+            TransferMode.DISK
+          );
+        } else {
+          logWarning(`Cannot convert from ${typeof data} to disk mode, trying stream mode instead`);
+          // If not a Buffer but another type, try stream mode as a last resort
+          transfer.transferMode = TransferMode.STREAM;
+          throw new Error(`Fallback to stream mode initiated for ${transfer.key}`);
+        }
+      } else if (transfer.transferMode === TransferMode.DISK && ((error as Error).message.includes('memory') || (error as Error).message.includes('disk'))) {
+        logWarning(`Disk mode failed for upload: ${(error as Error).message}`);
+        logWarning(`Switching to stream mode for ${transfer.key}`);
+        logVerbose(`This is an automatic downgrade due to resource constraints, not counted as a retry`);
+
+        // Switch to stream mode for a last attempt
+        transfer.transferMode = TransferMode.STREAM;
+        throw new Error(`Fallback to stream mode initiated for ${transfer.key}`);
+      } else {
+        // For other errors, throw directly
+        throw error;
+      }
+    }
+
+    // Mark as succeeded
+    transfer.status = TransferStatus.SUCCEEDED;
+
+    // Calculate final speed information
+    let finalSpeedInfo = '';
+    if (isStreamMode) {
+      // For stream mode, show the average transfer speed
+      const avgSpeed = transfer.uploadSpeed ? formatSpeed(transfer.uploadSpeed) : 'N/A';
+      finalSpeedInfo = avgSpeed;
+    } else {
+      // For memory/disk mode, show the average upload speed
+      const avgSpeed = transfer.uploadSpeed ? formatSpeed(transfer.uploadSpeed) : 'N/A';
+      finalSpeedInfo = avgSpeed;
+    }
+
+    progressBar.update(100, {
+      status: chalk.green('Succeeded'),
+      speed: finalSpeedInfo
+    });
+    stats.succeeded++;
+
+    // Verify content hash if enabled for memory/disk mode
+    if (config.verifyFileContentAfterMigration && transfer.sourceHash) {
+      try {
+        progressBar.update(100, {
+          status: chalk.blue(`Verifying content`),
+          speed: ''
+        });
+
+        // Calculate hash of the target object
+        logVerbose(`Calculating target hash for ${transfer.key}`);
+        transfer.targetHash = await getObjectHash(
+          targetClient,
+          config.target.bucket,
+          transfer.key,
+          'md5',
+          tempDir
+        );
+
+        // Compare hashes
+        if (transfer.sourceHash === transfer.targetHash) {
+          transfer.contentVerified = true;
+          progressBar.update(100, {
+            status: chalk.green('Content Verified'),
+            speed: finalSpeedInfo
+          });
+          logSuccess(`Content verified for ${transfer.key}: ${transfer.sourceHash}`);
+        } else {
+          transfer.contentVerified = false;
+          transfer.status = TransferStatus.CONTENT_VERIFICATION_FAILED;
+          stats.succeeded--;
+          stats.contentVerificationFailed++;
+          stats.failedFiles.push(transfer);
+
+          progressBar.update(100, {
+            status: chalk.red('Content Verification Failed'),
+            speed: finalSpeedInfo
+          });
+
+          logError(`Content verification failed for ${transfer.key}`);
+          logError(`Source hash: ${transfer.sourceHash}`);
+          logError(`Target hash: ${transfer.targetHash}`);
+        }
+      } catch (error) {
+        logWarning(`Failed to verify content for ${transfer.key}: ${(error as Error).message}`);
+      }
+    }
+
+    // Record transfer mode
+    if (!stats.transfersByMode) {
+      stats.transfersByMode = [];
+    }
+    stats.transfersByMode.push({ ...transfer });
+
+    logSuccess(`Successfully transferred: ${transfer.key} using ${transfer.transferMode} mode`);
+
+    // Clean up temp file if it exists and wasn't automatically deleted
+    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
+      try {
+        await fs.promises.unlink(transfer.tempFilePath);
+        logVerbose(`Removed temporary file: ${transfer.tempFilePath}`);
+      } catch {
+        logWarning(`Failed to remove temporary file: ${transfer.tempFilePath}`);
+      }
+    }
+  } catch (error) {
+    const err = error as Error;
+    transfer.error = err.message;
+    logError(`Error transferring file: ${transfer.key}`, err);
+
+    // Clean up temp file if it exists
+    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
+      try {
+        await fs.promises.unlink(transfer.tempFilePath);
+        logVerbose(`Removed temporary file after error: ${transfer.tempFilePath}`);
+      } catch {
+        logWarning(`Failed to remove temporary file after error: ${transfer.tempFilePath}`);
+      }
+    }
+
+    // Check if we should retry
+    if (transfer.retryCount < maxRetries) {
+      transfer.retryCount++;
+      transfer.status = TransferStatus.RETRYING;
+
+      progressBar.update(transfer.progress || 0, {
+        status: chalk.yellow(`Retrying (${transfer.retryCount}/${maxRetries})`),
+        speed: ''
+      });
+      logWarning(`Retrying file (${transfer.retryCount}/${maxRetries}): ${transfer.key}`);
+
+      // Retry after a short delay
+      await new Promise<void>(resolve => { setTimeout(resolve, 1000); });
+      return processObject(sourceClient, targetClient, config, transfer, progressBar, stats, maxRetries);
+    } else {
+      // Mark as failed
+      transfer.status = TransferStatus.FAILED;
+      progressBar.update(transfer.progress || 0, {
+        status: chalk.red('Failed'),
+        speed: ''
+      });
+
+      stats.failed++;
+      stats.failedFiles.push(transfer);
+      logError(`File transfer failed after ${maxRetries} retries: ${transfer.key}`, err);
+
+      // Pause migration if this is the first failure
+      if (stats.failed === 1) {
+        stats.paused = true;
+        logWarning(`Migration paused due to failure: ${transfer.key}`);
+      }
+    }
+  }
+}
+
+/**
+ * Format time duration in seconds to human-readable string
+ */
+function formatTime(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  const parts = [];
+  if (hours > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0) {
+    parts.push(`${minutes}m`);
+  }
+  if (secs > 0 || parts.length === 0) {
+    parts.push(`${secs}s`);
+  }
+
+  return parts.join(' ');
 }
 
 /**
@@ -110,30 +1257,42 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
   initLogger(config);
 
   try {
-    console.log(chalk.blue.bold('Starting S3 migration...'));
-    log(LogLevel.INFO, 'Starting S3 migration...');
-    console.log(chalk.gray('Source:'), chalk.yellow(`${config.source.endpoint}/${config.source.bucket}`));
-    console.log(chalk.gray('Target:'), chalk.yellow(`${config.target.endpoint}/${config.target.bucket}`));
-    console.log(chalk.gray('Concurrency:'), chalk.yellow(config.concurrency));
-    console.log(chalk.gray('Max Retries:'), chalk.yellow(config.maxRetries));
-    console.log(chalk.gray('Verify After Migration:'), chalk.yellow(config.verifyAfterMigration));
-    console.log(chalk.gray('Purge Source After Migration:'), chalk.yellow(config.purgeSourceAfterMigration));
+    // Create S3 clients early so we can use them for checking target bucket
+    const sourceClient = createS3Client(config.source);
+    const targetClient = createS3Client(config.target);
+
+    logInfo('Starting S3 migration...', chalk.cyan);
+    logInfo(`Source: ${config.source.endpoint}/${config.source.bucket}`, chalk.cyan);
+    logInfo(`Target: ${config.target.endpoint}/${config.target.bucket}`, chalk.cyan);
+    logInfo(`Concurrency: ${config.concurrency}`, chalk.white);
+    logInfo(`Max Retries: ${config.maxRetries}`, chalk.white);
+    logInfo(`Verify After Migration: ${config.verifyAfterMigration}`, chalk.white);
+    logInfo(`Verify File Content After Migration: ${config.verifyFileContentAfterMigration}`, chalk.white);
+    logInfo(`Purge Source After Migration: ${config.purgeSourceAfterMigration}`, chalk.white);
+
+    // Log if we're skipping target existence check
+    if (config.skipTargetExistenceCheck) {
+      logInfo(`Skip Target Existence Check: true`, chalk.magenta);
+      logWarning('Skipping check for existing files in target bucket.');
+    }
 
     // Initialize transfer mode if not already set
     if (!config.transferMode) {
-      config.transferMode = TransferMode.AUTO;
+      config.transferMode = TransferMode.AUTO; // 默认使用AUTO模式
+      logInfo(`Using AUTO mode as default for intelligent selection based on file characteristics`, chalk.cyan);
     }
-    console.log(chalk.gray('Transfer Mode:'), chalk.yellow(config.transferMode));
+
+    logInfo(`Transfer Mode: ${config.transferMode}`, chalk.magenta);
 
     // Display available memory
     const availableMemory = getAvailableMemory();
-    console.log(chalk.gray('Available Memory:'), chalk.yellow(formatBytes(availableMemory)));
+    logInfo(`Available Memory: ${formatBytes(availableMemory)}`, chalk.white);
 
     // Initialize temp directory if disk mode is possible
     if (config.transferMode === TransferMode.AUTO || config.transferMode === TransferMode.DISK) {
       // Use provided temp directory or create a default one
       config.tempDir = config.tempDir || path.join(process.cwd(), 'tmp');
-      console.log(chalk.gray('Temp Directory:'), chalk.yellow(config.tempDir));
+      logInfo(`Temp Directory: ${config.tempDir}`, chalk.white);
 
       // Make sure temp directory exists
       await fsExtra.ensureDir(config.tempDir);
@@ -141,27 +1300,23 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
 
     // Only display prefix if it's provided
     if (config.prefix) {
-      console.log(chalk.gray('Prefix:'), chalk.yellow(config.prefix));
+      logInfo(`Prefix: ${config.prefix}`, chalk.cyan);
     }
 
     // Display include patterns if provided
     if (config.include && config.include.length > 0) {
-      console.log(chalk.gray('Include patterns:'), chalk.yellow(config.include.join(', ')));
+      logInfo(`Include patterns: ${config.include.join(', ')}`, chalk.cyan);
     }
 
     // Display exclude patterns if provided
     if (config.exclude && config.exclude.length > 0) {
-      console.log(chalk.gray('Exclude patterns:'), chalk.yellow(config.exclude.join(', ')));
+      logInfo(`Exclude patterns: ${config.exclude.join(', ')}`, chalk.cyan);
     }
 
     if (config.dryRun) {
-      console.log(chalk.yellow.bold('DRY RUN MODE - No files will be transferred'));
+      logWarning('DRY RUN MODE - No files will be transferred');
       log(LogLevel.WARNING, 'DRY RUN MODE - No files will be transferred');
     }
-
-    // Create S3 clients
-    const sourceClient = createS3Client(config.source);
-    const targetClient = createS3Client(config.target);
 
     // Initialize stats
     const stats: MigrationStats = {
@@ -171,6 +1326,7 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       failed: 0,
       skipped: 0,
       verificationFailed: 0,
+      contentVerificationFailed: 0,
       startTime: Date.now(),
       failedFiles: [],
       paused: false,
@@ -222,7 +1378,7 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
     }
 
     if (stats.total === 0) {
-      console.log(chalk.yellow('No objects to migrate. Exiting.'));
+      logWarning('No objects to migrate. Exiting.');
       return;
     }
 
@@ -234,8 +1390,23 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       progress: 0
     }));
 
+    // Check for duplicate files in target bucket before proceeding
+    if (!config.skipTargetExistenceCheck && !config.dryRun) {
+      await checkAndHandleDuplicateFiles(targetClient, config, transfers);
+
+      // After checking duplicates, update stats for skipped files
+      const skippedFiles = transfers.filter(t => t.status === TransferStatus.SKIPPED);
+      if (skippedFiles.length > 0) {
+        stats.skipped += skippedFiles.length;
+
+        // Log information about skipped files
+        logWarning(`Skipping ${skippedFiles.length} files that already exist in target bucket.`);
+        log(LogLevel.INFO, `Adjusted migration count: ${stats.total - skippedFiles.length} files will be migrated.`, false);
+      }
+    }
+
     // After listing and filtering objects, check for large files
-    if (stats.total > 0 && config.transferMode === TransferMode.AUTO) {
+    if (stats.total > 0) {
       // Find the largest file
       let largestFileSize = 0;
       let largestFile = '';
@@ -255,58 +1426,98 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
           largestFileSize = transfer.size;
           largestFile = transfer.key;
         }
+
+        // First, respect user's global config if specified
+        if (config.transferMode && config.transferMode !== TransferMode.AUTO && !transfer.transferMode) {
+          // Apply the user's globally specified transfer mode to this file
+          transfer.transferMode = config.transferMode;
+          logVerbose(`Using user-specified ${transfer.transferMode} mode for ${transfer.key}`);
+        }
+
+        // If no mode specified yet or auto mode, determine the best mode
+        if (!transfer.transferMode || transfer.transferMode === TransferMode.AUTO) {
+          // Apply the intelligent mode selection algorithm
+          const availableMemory = getAvailableMemory();
+          transfer.transferMode = determineOptimalTransferMode(
+            transfer.size || 0,
+            transfer.key,
+            availableMemory
+          );
+
+          logVerbose(`Auto-selected ${transfer.transferMode} mode for ${transfer.key} based on file characteristics`);
+
+          // Safety check - for very large files relative to memory, always use STREAM mode
+          if (transfer.size && transfer.size > availableMemory * 0.8 && transfer.transferMode !== TransferMode.STREAM) {
+            logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large relative to available memory (${formatBytes(availableMemory)}), overriding to STREAM mode`);
+            transfer.transferMode = TransferMode.STREAM;
+          }
+        }
+
+        // Resource-based safety checks for all modes (including user-specified modes)
+        // These will only change the mode if there are resource constraints
+
+        // Create temp directory if needed for disk or memory mode (that could fallback to disk)
+        let tempDir = config.tempDir;
+        if ((transfer.transferMode === TransferMode.DISK || transfer.transferMode === TransferMode.MEMORY) && !tempDir) {
+          tempDir = path.join(process.cwd(), 'tmp');
+          await fsExtra.ensureDir(tempDir);
+        }
+
+        // Check if memory mode is suitable for this file's size
+        if (transfer.transferMode === TransferMode.MEMORY && transfer.size) {
+          const availableMemory = os.freemem();
+
+          // If file is larger than 50% of available memory, switch to disk mode
+          if (transfer.size > availableMemory * 0.5) {
+            logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large for memory mode, switching to disk mode`);
+            transfer.transferMode = TransferMode.DISK;
+          }
+        }
+
+        // Check if disk mode is suitable for this file's size
+        if (transfer.transferMode === TransferMode.DISK && transfer.size) {
+          const availableMemory = os.freemem();
+
+          // If file is larger than 80% of available memory, switch to stream mode
+          if (transfer.size > availableMemory * 0.8) {
+            logWarning(`File ${transfer.key} (${formatBytes(transfer.size)}) is too large for disk mode, switching to stream mode`);
+            transfer.transferMode = TransferMode.STREAM;
+          }
+        }
       }
 
-      // Calculate suggested transfer mode based on the largest file
-      const suggestedMode = determineTransferMode(largestFileSize, config);
+      // If no global transfer mode is specified by user, use AUTO mode
+      if (!config.transferMode) {
+        config.transferMode = TransferMode.AUTO;
+        logInfo(`No transfer mode specified, using AUTO mode for intelligent selection`, chalk.cyan);
+      }
 
-      // If largest file exceeds memory threshold, suggest appropriate transfer mode
-      if (suggestedMode !== TransferMode.MEMORY) {
-        console.log('');
-        console.log(chalk.yellow('Large file detected:'), chalk.blue(largestFile));
-        console.log(chalk.yellow('Size:'), chalk.blue(formatBytes(largestFileSize)));
-        console.log(chalk.yellow('Available memory:'), chalk.blue(formatBytes(availableMemory)));
+      // Display the file size information if there are large files
+      if (largestFileSize > 0) {
+        // Always display file size and memory information
+        logInfo('', chalk.white); // Empty line
+        logInfo(`Largest file detected: ${largestFile}`, chalk.cyan);
+        logInfo(`Size: ${formatBytes(largestFileSize)}`, chalk.white);
+        logInfo(`Available memory: ${formatBytes(availableMemory)}`, chalk.white);
 
-        if (!config.skipConfirmation) {
-          const { selectedMode } = await inquirer.prompt([
-            {
-              type: 'list',
-              name: 'selectedMode',
-              message: 'Choose a transfer mode for large files:',
-              choices: [
-                { name: `Memory (fastest, but may cause out-of-memory for files > ${formatBytes(availableMemory * 0.5)})`, value: TransferMode.MEMORY },
-                { name: `Disk (good balance, uses temp files in ${config.tempDir})`, value: TransferMode.DISK },
-                { name: 'Stream (slowest, but uses minimal memory)', value: TransferMode.STREAM },
-                { name: 'Auto (choose best mode based on file size)', value: TransferMode.AUTO }
-              ],
-              default: suggestedMode
-            }
-          ]);
-
-          config.transferMode = selectedMode;
-          console.log(chalk.blue(`Using transfer mode: ${config.transferMode}`));
-          log(LogLevel.INFO, `Transfer mode selected: ${config.transferMode}`);
-        } else {
-          // If confirmation is skipped, use the suggested mode
-          config.transferMode = suggestedMode;
-          console.log(chalk.blue(`Automatically selected transfer mode: ${config.transferMode}`));
-          log(LogLevel.INFO, `Transfer mode automatically selected: ${config.transferMode}`);
-        }
+        // Display selected transfer mode
+        logInfo(`Using transfer mode: ${config.transferMode}`, chalk.magenta);
+        logInfo(`Note: Stream mode is now recommended for all files for better reliability.`, chalk.yellow);
       }
     }
 
     // Show sample of files to migrate (first 10 files)
     if (transfers.length > 0) {
-      console.log(chalk.cyan('\nFiles to migrate (showing first 10):'));
+      logInfo('\nFiles to migrate (showing first 10):', chalk.cyan);
       const samplesToShow = Math.min(transfers.length, 10);
       for (let i = 0; i < samplesToShow; i++) {
-        console.log(chalk.gray(`  - ${transfers[i].key}`));
+        logInfo(`  - ${transfers[i].key}`, chalk.white);
       }
 
       if (transfers.length > 10) {
-        console.log(chalk.gray(`  ... and ${transfers.length - 10} more files`));
+        logInfo(`  ... and ${transfers.length - 10} more files`, chalk.white);
       }
-      console.log('');
+      logInfo('', chalk.white);
     }
 
     // Ask user for confirmation before proceeding (unless skipConfirmation is true)
@@ -321,22 +1532,22 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       ]);
 
       if (!confirmMigration) {
-        console.log(chalk.yellow('Migration cancelled by user.'));
+        logWarning('Migration cancelled by user.');
         return;
       }
     } else {
-      console.log(chalk.blue(`Proceeding with migration of ${chalk.bold(stats.total.toString())} objects (confirmation skipped)`));
+      log(LogLevel.INFO, `Proceeding with migration of ${stats.total.toString()} objects (confirmation skipped)`, false);
     }
 
-    // Create progress bar
+    // Create multibar
     const multibar = new cliProgress.MultiBar({
       clearOnComplete: false,
       hideCursor: true,
       format: ' {bar} | {percentage}% | {value}/{total} | {status} | {file} | {speed}',
     }, cliProgress.Presets.shades_grey);
 
-    // Create overall progress bar
-    const overallBar = multibar.create(stats.total, 0, {
+    // Create overall progress bar - used to track overall migration progress
+    multibar.create(stats.total, 0, {
       status: chalk.blue('In Progress'),
       file: 'Overall Progress',
       speed: '',
@@ -351,8 +1562,8 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
     const fileProgressBars: { [key: string]: cliProgress.SingleBar } = {};
 
     // Start migration
-    console.log(chalk.blue(`Starting migration with concurrency of ${chalk.bold(concurrency.toString())}`));
-    console.log('');
+    logInfo(`Starting migration with concurrency of ${concurrency.toString()}`, chalk.cyan);
+    logInfo('', chalk.white);
 
     // Process files
     let currentIndex = 0;
@@ -374,7 +1585,7 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
         ]);
 
         if (action === 'stop') {
-          console.log(chalk.yellow('Migration stopped by user.'));
+          logWarning('Migration stopped by user.');
           break;
         } else if (action === 'skip') {
           // Mark all failed files as skipped
@@ -403,7 +1614,7 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
       // Process batch
       await Promise.all(
         batch.map(async (transfer) => {
-          // Skip already processed files
+          // Skip if already processed files
           if (
             transfer.status === TransferStatus.SUCCEEDED ||
             transfer.status === TransferStatus.SKIPPED
@@ -423,756 +1634,82 @@ export async function runMigration(config: MigrationConfig): Promise<void> {
 
           const progressBar = fileProgressBars[transfer.key];
 
-          try {
-            // Get file size
-            if (!transfer.size) {
-              progressBar.update(0, {
-                status: chalk.blue('Getting size'),
-                speed: ''
-              });
-
-              transfer.size = await getObjectSize(sourceClient, config.source.bucket, transfer.key);
-            }
-
-            // Process the file
-            await processObject(
-              sourceClient,
-              targetClient,
-              config,
-              transfer,
-              progressBar,
-              stats,
-              maxRetries
-            );
-
-            // Update overall progress
-            stats.processed++;
-            overallBar.update(stats.processed, {
-              status: getOverallStatus(stats),
-              percentage: Math.floor((stats.processed / stats.total) * 100)
-            });
-
-            // Remove progress bar for this file
-            if (progressBar) {
-              multibar.remove(progressBar);
-              delete fileProgressBars[transfer.key];
-            }
-
-            // 记录传输模式
-            if (!stats.transfersByMode) {
-              stats.transfersByMode = [];
-            }
-            stats.transfersByMode.push({ ...transfer });
-          } catch (error) {
-            // This should not happen as errors are handled in processObject
-            console.error(chalk.red(`Unexpected error: ${(error as Error).message}`));
-          }
+          await processObject(sourceClient, targetClient, config, transfer, progressBar, stats, maxRetries);
         })
       );
 
-      // Move to next batch if not paused
-      if (!stats.paused) {
-        currentIndex = endIndex;
+      currentIndex = endIndex;
+    }
+
+    /**
+     * Print final summary
+     */
+    const printSummary = (stats: MigrationStats): void => {
+      const elapsedTime = Math.floor(((stats.endTime || Date.now()) - stats.startTime) / 1000);
+
+      // Count by transfer mode
+      const transferModeCounts: Record<string, number> = {};
+
+      for (const transfer of stats.transfersByMode || []) {
+        const mode = transfer.transferMode || TransferMode.STREAM;
+        transferModeCounts[mode] = (transferModeCounts[mode] || 0) + 1;
       }
-    }
 
-    // Stop all progress bars
-    multibar.stop();
-    console.log('\n');
+      logInfo('Migration Summary', chalk.cyanBright.bold);
+      logInfo('─'.repeat(50), chalk.white);
+      logInfo(`Total objects:      ${stats.total.toString()}`, chalk.white);
+      logInfo(`Succeeded:          ${stats.succeeded.toString()}`, chalk.green);
+      logInfo(`Failed:             ${stats.failed.toString()}`, chalk.redBright);
+      logInfo(`Verification failed: ${stats.verificationFailed.toString()}`, chalk.yellow);
+      logInfo(`Content verification failed: ${stats.contentVerificationFailed.toString()}`, chalk.yellow);
+      logInfo(`Skipped:            ${stats.skipped.toString()}`, chalk.gray);
+      logInfo(`Total time:         ${formatTime(elapsedTime)}`, chalk.white);
 
-    // Set end time
-    stats.endTime = Date.now();
+      // Add detailed summary to log file
+      log(LogLevel.INFO, `Migration Summary - Total: ${stats.total}, Succeeded: ${stats.succeeded}, Failed: ${stats.failed}, Verification failed: ${stats.verificationFailed}, Content verification failed: ${stats.contentVerificationFailed}, Skipped: ${stats.skipped}, Time: ${formatTime(elapsedTime)}`);
 
-    // Verify files in target bucket if enabled
-    if (config.verifyAfterMigration && !config.dryRun && stats.succeeded > 0) {
-      await verifyMigratedFiles(targetClient, config.target.bucket, transfers, stats);
-    }
+      // Print transfer mode stats if available
+      if (Object.keys(transferModeCounts).length > 0) {
+        logInfo('', chalk.white);
+        logInfo('Transfer Modes Used', chalk.cyanBright.bold);
+        logInfo('─'.repeat(50), chalk.white);
 
-    // Print final summary
-    printSummary(stats);
-
-    // Handle failed files
-    if (stats.failed > 0 || stats.verificationFailed > 0) {
-      await handleFailedFiles(sourceClient, targetClient, config, transfers, stats);
-    } else if (stats.succeeded === stats.total) {
-      // All files migrated successfully, ask if user wants to purge source
-      if (config.purgeSourceAfterMigration && !config.dryRun) {
-        await handlePurgeSource(sourceClient, config.source.bucket, transfers);
+        for (const [mode, count] of Object.entries(transferModeCounts)) {
+          let displayMode = mode;
+          if (mode === TransferMode.STREAM) {
+            displayMode = `${mode} (direct piping)`;
+          }
+          logInfo(`${displayMode}: ${count.toString()}`, chalk.white);
+        }
       }
-    }
-  } catch (error) {
-    // Log any uncaught errors
-    logError('Uncaught error during migration', error as Error);
-    throw error;
-  } finally {
-    // Close logger when migration is complete
-    closeLogger();
-  }
-}
 
-/**
- * Verify that all migrated files exist in the target bucket
- */
-async function verifyMigratedFiles(
-  targetClient: S3Client,
-  targetBucket: string,
-  transfers: FileTransfer[],
-  stats: MigrationStats
-): Promise<void> {
-  console.log(chalk.blue('Verifying migrated files in target bucket...'));
-  log(LogLevel.INFO, 'Verifying migrated files in target bucket...');
+      if (stats.failed > 0 || stats.verificationFailed > 0 || stats.contentVerificationFailed > 0) {
+        logInfo('', chalk.white);
+        logWarning('Failed files:');
 
-  // Only verify files that were marked as succeeded
-  const successfulTransfers = transfers.filter(t => t.status === TransferStatus.SUCCEEDED);
-  logVerbose(`Starting verification of ${successfulTransfers.length} files`);
+        for (const file of stats.failedFiles) {
+          if (file.status === TransferStatus.CONTENT_VERIFICATION_FAILED) {
+            logError(`  ✗ ${file.key} (Content verification failed - source: ${file.sourceHash}, target: ${file.targetHash})`);
+          } else {
+            logError(`  ✗ ${file.key} (${file.error || 'Unknown error'})`);
+          }
+        }
+      }
 
-  let verified = 0;
-  let failed = 0;
+      logInfo('', chalk.white);
 
-  // Create a progress bar
-  const verifyBar = new cliProgress.SingleBar({
-    format: ' {bar} | {percentage}% | Verifying: {value}/{total} | ' +
-      chalk.green('{verified}') + '/' + chalk.red('{failed}') + ' | {file}',
-    barCompleteChar: '\u2588',
-    barIncompleteChar: '\u2591',
-  }, cliProgress.Presets.shades_classic);
-
-  verifyBar.start(successfulTransfers.length, 0, {
-    verified: 0,
-    failed: 0,
-    file: ''
-  });
-
-  let i = 0;
-  for (const transfer of successfulTransfers) {
-    try {
-      logVerbose(`Verifying file: ${transfer.key}`);
-      const exists = await objectExists(targetClient, targetBucket, transfer.key);
-
-      if (exists) {
-        transfer.verified = true;
-        verified++;
-        logVerbose(`File verified successfully: ${transfer.key}`);
+      if (stats.succeeded === stats.total) {
+        logSuccess('✓ Migration completed successfully!');
+      } else if (stats.succeeded > 0) {
+        logWarning('⚠ Migration completed with some issues.');
       } else {
-        transfer.verified = false;
-        transfer.status = TransferStatus.VERIFICATION_FAILED;
-        transfer.error = 'File not found in target bucket after migration';
-        stats.verificationFailed++;
-        stats.succeeded--;
-        stats.failedFiles.push(transfer);
-        failed++;
-        logError(`Verification failed - file not found in target: ${transfer.key}`);
+        logError('✗ Migration failed!');
       }
+    };
 
-      // Update progress bar
-      i++;
-      verifyBar.update(i, {
-        verified: verified,
-        failed: failed,
-        file: transfer.key.length > 30 ? '...' + transfer.key.slice(-30) : transfer.key
-      });
-    } catch (error) {
-      transfer.verified = false;
-      transfer.status = TransferStatus.VERIFICATION_FAILED;
-      transfer.error = `Verification error: ${(error as Error).message}`;
-      stats.verificationFailed++;
-      stats.succeeded--;
-      stats.failedFiles.push(transfer);
-      failed++;
-      logError(`Error during verification of file: ${transfer.key}`, error as Error);
-    }
-  }
-
-  verifyBar.update(successfulTransfers.length, {
-    verified: verified,
-    failed: failed,
-    file: ''
-  });
-  verifyBar.stop();
-
-  if (failed > 0) {
-    console.log(chalk.red(`Verification completed with ${failed} failures`));
-    logWarning(`Verification completed with ${failed} failures`);
-  } else {
-    console.log(chalk.green(`All ${verified} files verified successfully`));
-    logSuccess(`All ${verified} files verified successfully`);
-  }
-}
-
-/**
- * Handle failed files after migration
- */
-async function handleFailedFiles(
-  sourceClient: S3Client,
-  targetClient: S3Client,
-  config: MigrationConfig,
-  transfers: FileTransfer[],
-  stats: MigrationStats
-): Promise<void> {
-  const totalFailed = stats.failed + stats.verificationFailed;
-
-  const { retry } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'retry',
-      message: `${totalFailed} files failed to migrate. Do you want to retry?`,
-      default: true
-    }
-  ]);
-
-  if (retry) {
-    console.log(chalk.blue('Retrying failed files...'));
-    log(LogLevel.INFO, `Retrying ${totalFailed} failed files.`);
-
-    // Reset failed files status
-    for (const file of stats.failedFiles) {
-      file.status = TransferStatus.PENDING;
-      file.retryCount = 0;
-      file.verified = undefined;
-    }
-
-    // Create a new config with only failed files
-    const retryConfig = { ...config };
-    const failedKeys = stats.failedFiles.map(f => f.key);
-
-    // Filter transfers to only include failed files
-    const retryTransfers = transfers.filter(t => failedKeys.includes(t.key));
-
-    // Run migration again with only failed files
-    await runMigrationForFiles(sourceClient, targetClient, retryConfig, retryTransfers);
-  }
-}
-
-/**
- * Run migration for specific files
- */
-async function runMigrationForFiles(
-  sourceClient: S3Client,
-  targetClient: S3Client,
-  config: MigrationConfig,
-  transfers: FileTransfer[]
-): Promise<void> {
-  // Initialize stats
-  const stats: MigrationStats = {
-    total: transfers.length,
-    processed: 0,
-    succeeded: 0,
-    failed: 0,
-    skipped: 0,
-    verificationFailed: 0,
-    startTime: Date.now(),
-    failedFiles: [],
-    paused: false,
-    transfersByMode: []
-  };
-
-  log(LogLevel.INFO, `Starting migration of ${transfers.length} files from ${config.source.bucket} to ${config.target.bucket}`);
-
-  // Create progress bar
-  const multibar = new cliProgress.MultiBar({
-    clearOnComplete: false,
-    hideCursor: true,
-    format: ' {bar} | {percentage}% | {value}/{total} | {status} | {file} | {speed}',
-  }, cliProgress.Presets.shades_grey);
-
-  // Create overall progress bar
-  const overallBar = multibar.create(stats.total, 0, {
-    status: chalk.blue('In Progress'),
-    file: 'Retry Progress',
-    speed: '',
-    percentage: 0
-  });
-
-  // Process objects in batches with concurrency
-  const concurrency = config.concurrency || 5;
-  const maxRetries = config.maxRetries || 3;
-
-  // Create file progress bars (one for each concurrent transfer)
-  const fileProgressBars: { [key: string]: cliProgress.SingleBar } = {};
-
-  // Start migration
-  console.log(chalk.blue(`Starting retry with concurrency of ${chalk.bold(concurrency.toString())}`));
-  console.log('');
-
-  // Process files in batches
-  for (let i = 0; i < transfers.length; i += concurrency) {
-    const batch = transfers.slice(i, Math.min(i + concurrency, transfers.length));
-
-    await Promise.all(
-      batch.map(async (transfer) => {
-        // Create progress bar for this file
-        if (!fileProgressBars[transfer.key]) {
-          fileProgressBars[transfer.key] = multibar.create(100, 0, {
-            status: chalk.blue('Pending'),
-            file: transfer.key.length > 30 ? '...' + transfer.key.slice(-30) : transfer.key,
-            speed: '',
-            percentage: 0
-          });
-        }
-
-        const progressBar = fileProgressBars[transfer.key];
-
-        try {
-          // Get file size if not already known
-          if (!transfer.size) {
-            progressBar.update(0, {
-              status: chalk.blue('Getting size'),
-              speed: ''
-            });
-
-            transfer.size = await getObjectSize(sourceClient, config.source.bucket, transfer.key);
-          }
-
-          // Process the file
-          await processObject(
-            sourceClient,
-            targetClient,
-            config,
-            transfer,
-            progressBar,
-            stats,
-            maxRetries
-          );
-
-          // Update overall progress
-          stats.processed++;
-          overallBar.update(stats.processed, {
-            status: getOverallStatus(stats),
-            percentage: Math.floor((stats.processed / stats.total) * 100)
-          });
-
-          // Remove progress bar for this file
-          if (progressBar) {
-            multibar.remove(progressBar);
-            delete fileProgressBars[transfer.key];
-          }
-        } catch (error) {
-          console.error(chalk.red(`Unexpected error: ${(error as Error).message}`));
-        }
-      })
-    );
-  }
-
-  // Stop all progress bars
-  multibar.stop();
-  console.log('\n');
-
-  // Set end time
-  stats.endTime = Date.now();
-
-  // Verify files in target bucket if enabled
-  if (config.verifyAfterMigration && !config.dryRun && stats.succeeded > 0) {
-    await verifyMigratedFiles(targetClient, config.target.bucket, transfers, stats);
-  }
-
-  // Print final summary
-  printSummary(stats);
-
-  // Handle failed files
-  if (stats.failed > 0 || stats.verificationFailed > 0) {
-    await handleFailedFiles(sourceClient, targetClient, config, transfers, stats);
-  }
-}
-
-/**
- * Handle purging source bucket after successful migration
- */
-async function handlePurgeSource(
-  sourceClient: S3Client,
-  sourceBucket: string,
-  transfers: FileTransfer[]
-): Promise<void> {
-  // Get successfully migrated files
-  const successfulTransfers = transfers.filter(t =>
-    t.status === TransferStatus.SUCCEEDED && t.verified === true
-  );
-
-  if (successfulTransfers.length === 0) {
-    log(LogLevel.INFO, 'No files to purge from source bucket');
-    return;
-  }
-
-  log(LogLevel.INFO, `Preparing to purge ${successfulTransfers.length} files from source bucket`);
-
-  const { confirmPurge } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'confirmPurge',
-      message: `Do you want to delete ${successfulTransfers.length} successfully migrated files from the source bucket?`,
-      default: false
-    }
-  ]);
-
-  if (!confirmPurge) {
-    console.log(chalk.yellow('Source bucket purge cancelled.'));
-    log(LogLevel.INFO, 'Source bucket purge cancelled by user');
-    return;
-  }
-
-  // Double confirm
-  const { confirmAgain } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'confirmAgain',
-      message: chalk.red.bold(`WARNING: This will permanently delete ${successfulTransfers.length} files from the source bucket. Are you absolutely sure?`),
-      default: false
-    }
-  ]);
-
-  if (!confirmAgain) {
-    console.log(chalk.yellow('Source bucket purge cancelled.'));
-    log(LogLevel.INFO, 'Source bucket purge cancelled by user on second confirmation');
-    return;
-  }
-
-  // Proceed with deletion
-  console.log(chalk.blue(`Deleting ${successfulTransfers.length} files from source bucket...`));
-  log(LogLevel.INFO, `Starting deletion of ${successfulTransfers.length} files from source bucket`);
-
-  // Create progress bar
-  const purgeBar = new cliProgress.SingleBar({
-    format: ' {bar} | {percentage}% | {value}/{total} | {status}',
-    barCompleteChar: '\u2588',
-    barIncompleteChar: '\u2591',
-    hideCursor: true
-  });
-
-  // Initialize the progress bar
-  purgeBar.start(successfulTransfers.length, 0, {
-    status: chalk.blue('Deleting files...')
-  });
-
-  const keys = successfulTransfers.map(t => t.key);
-  let deletedCount = 0;
-  let failedCount = 0;
-
-  try {
-    const result = await deleteObjects(sourceClient, sourceBucket, keys,
-      (deleted, total) => {
-        // Update progress bar
-        purgeBar.update(deleted, {
-          status: chalk.blue(`Deleting files... ${deleted}/${total}`)
-        });
-        deletedCount = deleted;
-      }
-    );
-
-    // Complete the progress bar
-    purgeBar.update(successfulTransfers.length, {
-      status: chalk.green('Deletion completed')
-    });
-    purgeBar.stop();
-
-    if (result.failed.length > 0) {
-      failedCount = result.failed.length;
-      console.log(chalk.yellow(`\nDeletion completed with ${failedCount} failures`));
-      console.log(chalk.yellow('Failed to delete the following files:'));
-      logWarning(`Deletion completed with ${failedCount} failures`);
-
-      // Log failed files
-      for (const key of result.failed) {
-        console.log(chalk.red(`  - ${key}`));
-        logError(`Failed to delete file: ${key}`);
-      }
-    } else {
-      console.log(chalk.green(`\nSuccessfully deleted ${result.deleted.length} files from source bucket`));
-      logSuccess(`Successfully deleted ${result.deleted.length} files from source bucket`);
-    }
+    printSummary(stats);
   } catch (error) {
-    // Stop the progress bar in case of error
-    purgeBar.stop();
-    console.log(chalk.red(`\nFailed to delete files: ${(error as Error).message}`));
-    logError(`Failed to delete files from source bucket`, error as Error);
+    logError('Error running migration', error as Error);
+    process.exit(1);
   }
-
-  // Print summary
-  console.log(chalk.blue.bold('\nPurge Summary'));
-  console.log(chalk.blue('─'.repeat(50)));
-  console.log(chalk.gray('Total files:      '), chalk.white(successfulTransfers.length.toString()));
-  console.log(chalk.gray('Deleted:          '), chalk.green(deletedCount.toString()));
-  console.log(chalk.gray('Failed:           '), chalk.red(failedCount.toString()));
-
-  log(LogLevel.INFO, `Purge Summary - Total: ${successfulTransfers.length}, Deleted: ${deletedCount}, Failed: ${failedCount}`);
-
-  if (deletedCount === successfulTransfers.length) {
-    console.log(chalk.green.bold('\n✓ Source bucket purge completed successfully!'));
-    logSuccess('Source bucket purge completed successfully!');
-  } else if (deletedCount > 0) {
-    console.log(chalk.yellow.bold('\n⚠ Source bucket purge completed with some issues.'));
-    logWarning('Source bucket purge completed with some issues.');
-  } else {
-    console.log(chalk.red.bold('\n✗ Source bucket purge failed!'));
-    logError('Source bucket purge failed!');
-  }
-}
-
-/**
- * Get overall status text based on stats
- */
-function getOverallStatus(stats: MigrationStats): string {
-  if (stats.paused) {
-    return chalk.yellow('Paused');
-  } else if (stats.failed > 0) {
-    return chalk.yellow('Warning');
-  } else {
-    return chalk.blue('In Progress');
-  }
-}
-
-/**
- * Process a single object
- */
-async function processObject(
-  sourceClient: S3Client,
-  targetClient: S3Client,
-  config: MigrationConfig,
-  transfer: FileTransfer,
-  progressBar: cliProgress.SingleBar,
-  stats: MigrationStats,
-  maxRetries: number
-): Promise<void> {
-  // Skip if already processed
-  if (
-    transfer.status === TransferStatus.SUCCEEDED ||
-    transfer.status === TransferStatus.SKIPPED
-  ) {
-    return;
-  }
-
-  // Skip if in dry run mode
-  if (config.dryRun) {
-    transfer.status = TransferStatus.SKIPPED;
-    progressBar.update(100, {
-      status: chalk.yellow('Skipped (dry run)'),
-      speed: ''
-    });
-    stats.skipped++;
-    logVerbose(`Skipped file in dry run mode: ${transfer.key}`);
-    return;
-  }
-
-  try {
-    // Determine transfer mode based on file size
-    if (!transfer.transferMode && transfer.size) {
-      transfer.transferMode = determineTransferMode(transfer.size, config);
-      logVerbose(`Selected transfer mode for ${transfer.key}: ${transfer.transferMode}`);
-    }
-
-    // Create temp directory if needed
-    let tempDir = config.tempDir;
-    if (transfer.transferMode === TransferMode.DISK && !tempDir) {
-      tempDir = path.join(process.cwd(), 'tmp');
-      await fsExtra.ensureDir(tempDir);
-    }
-
-    // Download from source
-    transfer.status = TransferStatus.DOWNLOADING;
-    progressBar.update(0, {
-      status: chalk.blue(`Downloading (${transfer.transferMode})`),
-      speed: ''
-    });
-    logVerbose(`Starting download of ${transfer.key} using ${transfer.transferMode} mode`);
-
-    const data = await downloadObject(
-      sourceClient,
-      config.source.bucket,
-      transfer.key,
-      (downloaded, total, speed) => {
-        const progress = Math.floor((downloaded / total) * 50); // 0-50 for download
-        transfer.progress = progress;
-        transfer.downloadSpeed = speed;
-
-        progressBar.update(progress, {
-          status: chalk.blue(`Downloading (${transfer.transferMode})`),
-          speed: formatSpeed(speed)
-        });
-      },
-      transfer.transferMode,
-      tempDir
-    );
-
-    // Upload to target
-    transfer.status = TransferStatus.UPLOADING;
-    progressBar.update(50, {
-      status: chalk.blue(`Uploading (${transfer.transferMode})`),
-      speed: ''
-    });
-    logVerbose(`Starting upload of ${transfer.key} to target using ${transfer.transferMode} mode`);
-
-    // If using disk mode, store the temporary file path
-    if (typeof data === 'string') {
-      transfer.tempFilePath = data;
-    }
-
-    await uploadObject(
-      targetClient,
-      config.target.bucket,
-      transfer.key,
-      data,
-      (uploaded, total, speed) => {
-        const progress = 50 + Math.floor((uploaded / total) * 50); // 50-100 for upload
-        transfer.progress = progress;
-        transfer.uploadSpeed = speed;
-
-        progressBar.update(progress, {
-          status: chalk.blue(`Uploading (${transfer.transferMode})`),
-          speed: formatSpeed(speed)
-        });
-      },
-      transfer.transferMode === TransferMode.DISK // 如果是磁盘模式，上传后删除临时文件
-    );
-
-    // Mark as succeeded
-    transfer.status = TransferStatus.SUCCEEDED;
-    progressBar.update(100, {
-      status: chalk.green('Succeeded'),
-      speed: ''
-    });
-    stats.succeeded++;
-
-    // 记录传输模式
-    if (!stats.transfersByMode) {
-      stats.transfersByMode = [];
-    }
-    stats.transfersByMode.push({ ...transfer });
-
-    logSuccess(`Successfully transferred: ${transfer.key} using ${transfer.transferMode} mode`);
-
-    // Clean up temp file if it exists and wasn't automatically deleted
-    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
-      try {
-        await fs.promises.unlink(transfer.tempFilePath);
-        logVerbose(`Removed temporary file: ${transfer.tempFilePath}`);
-      } catch {
-        logWarning(`Failed to remove temporary file: ${transfer.tempFilePath}`);
-      }
-    }
-  } catch (error) {
-    const err = error as Error;
-    transfer.error = err.message;
-    logError(`Error transferring file: ${transfer.key}`, err);
-
-    // Clean up temp file if it exists
-    if (transfer.tempFilePath && fs.existsSync(transfer.tempFilePath)) {
-      try {
-        await fs.promises.unlink(transfer.tempFilePath);
-        logVerbose(`Removed temporary file after error: ${transfer.tempFilePath}`);
-      } catch {
-        logWarning(`Failed to remove temporary file after error: ${transfer.tempFilePath}`);
-      }
-    }
-
-    // Check if we should retry
-    if (transfer.retryCount < maxRetries) {
-      transfer.retryCount++;
-      transfer.status = TransferStatus.RETRYING;
-
-      progressBar.update(transfer.progress || 0, {
-        status: chalk.yellow(`Retrying (${transfer.retryCount}/${maxRetries})`),
-        speed: ''
-      });
-      logWarning(`Retrying file (${transfer.retryCount}/${maxRetries}): ${transfer.key}`);
-
-      // Retry after a short delay
-      await new Promise(resolve => { setTimeout(resolve, 1000) });
-      return processObject(sourceClient, targetClient, config, transfer, progressBar, stats, maxRetries);
-    } else {
-      // Mark as failed
-      transfer.status = TransferStatus.FAILED;
-      progressBar.update(transfer.progress || 0, {
-        status: chalk.red('Failed'),
-        speed: ''
-      });
-
-      stats.failed++;
-      stats.failedFiles.push(transfer);
-      logError(`File transfer failed after ${maxRetries} retries: ${transfer.key}`, err);
-
-      // Pause migration if this is the first failure
-      if (stats.failed === 1) {
-        stats.paused = true;
-        logWarning(`Migration paused due to failure: ${transfer.key}`);
-      }
-    }
-  }
-}
-
-/**
- * Print final summary
- */
-function printSummary(stats: MigrationStats): void {
-  const elapsedSeconds = Math.floor(((stats.endTime || Date.now()) - stats.startTime) / 1000);
-
-  // Count by transfer mode
-  const transferModeCounts: Record<string, number> = {};
-
-  for (const transfer of stats.transfersByMode || []) {
-    const mode = transfer.transferMode || TransferMode.MEMORY;
-    transferModeCounts[mode] = (transferModeCounts[mode] || 0) + 1;
-  }
-
-  console.log(chalk.blue.bold('Migration Summary'));
-  console.log(chalk.blue('─'.repeat(50)));
-  console.log(chalk.gray('Total objects:     '), chalk.white(stats.total.toString()));
-  console.log(chalk.gray('Succeeded:         '), chalk.green(stats.succeeded.toString()));
-  console.log(chalk.gray('Failed:            '), chalk.red(stats.failed.toString()));
-  console.log(chalk.gray('Verification failed:'), chalk.red(stats.verificationFailed.toString()));
-  console.log(chalk.gray('Skipped:           '), chalk.yellow(stats.skipped.toString()));
-  console.log(chalk.gray('Total time:        '), chalk.white(formatTime(elapsedSeconds)));
-
-  // Print transfer mode stats if available
-  if (Object.keys(transferModeCounts).length > 0) {
-    console.log('');
-    console.log(chalk.blue.bold('Transfer Modes Used'));
-    console.log(chalk.blue('─'.repeat(50)));
-
-    for (const [mode, count] of Object.entries(transferModeCounts)) {
-      console.log(chalk.gray(`${mode}:`), chalk.white(count.toString()));
-    }
-  }
-
-  // Log summary information
-  log(LogLevel.INFO, `Migration Summary - Total: ${stats.total}, Succeeded: ${stats.succeeded}, Failed: ${stats.failed}, Verification failed: ${stats.verificationFailed}, Skipped: ${stats.skipped}, Time: ${formatTime(elapsedSeconds)}`);
-
-  if (stats.failed > 0 || stats.verificationFailed > 0) {
-    console.log('');
-    console.log(chalk.yellow('Failed files:'));
-
-    for (const file of stats.failedFiles) {
-      console.log(chalk.red(`  ✗ ${file.key}`), chalk.gray(`(${file.error})`));
-    }
-  }
-
-  console.log('');
-
-  if (stats.succeeded === stats.total) {
-    console.log(chalk.green.bold('✓ Migration completed successfully!'));
-  } else if (stats.succeeded > 0) {
-    console.log(chalk.yellow.bold('⚠ Migration completed with some issues.'));
-  } else {
-    console.log(chalk.red.bold('✗ Migration failed!'));
-  }
-}
-
-/**
- * Format seconds into a human-readable time string
- */
-function formatTime(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainingSeconds = seconds % 60;
-
-  const parts = [];
-
-  if (hours > 0) {
-    parts.push(`${hours}h`);
-  }
-
-  if (minutes > 0 || hours > 0) {
-    parts.push(`${minutes}m`);
-  }
-
-  parts.push(`${remainingSeconds}s`);
-
-  return parts.join(' ');
 }

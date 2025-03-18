@@ -42,8 +42,27 @@ exclude:
   - "^temp/"
   - "\\.tmp$"
 
+# File transfer mode (default: auto)
+# Options:
+#   - auto: Automatically select the best mode based on file size
+#   - memory: Use memory for transfer (fastest, but not suitable for files > 80% of available memory)
+#   - disk: Use temporary files on disk (good balance between performance and memory usage)
+#   - stream: Stream files directly (lowest memory usage, but slower)
+transferMode: "auto"
+
+# Temporary directory for disk mode transfers (default: ./tmp)
+tempDir: "./tmp"
+
+# Large file size threshold in bytes (default: 50% of available memory)
+# Files larger than this will use disk or stream mode instead of memory mode
+largeFileSizeThreshold: 104857600 # 100MB
+
 # Verify objects exist in target after migration (default: true)
 verifyAfterMigration: true
+
+# Verify file content after migration using checksums (default: false)
+# This provides an additional integrity check beyond existence verification
+verifyFileContentAfterMigration: false
 
 # Delete objects from source after successful migration (default: false)
 purgeSourceAfterMigration: false

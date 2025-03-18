@@ -1,6 +1,11 @@
-import fs from 'fs';
-import path from 'path';
+// Node.js built-in modules
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Third-party dependencies
 import yaml from 'js-yaml';
+
+// Types
 import type { MigrationConfig, S3Credentials } from './types';
 
 /**
@@ -78,6 +83,11 @@ function validateConfig(config: MigrationConfig): void {
   // Set default verification option
   if (typeof config.verifyAfterMigration !== 'boolean') {
     config.verifyAfterMigration = true; // Default to verify after migration
+  }
+
+  // Set default content verification option
+  if (typeof config.verifyFileContentAfterMigration !== 'boolean') {
+    config.verifyFileContentAfterMigration = false; // Default to not verify file content
   }
 
   // Set default purge source option

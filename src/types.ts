@@ -10,12 +10,12 @@ export interface S3Credentials {
   signatureVersion?: 'v2' | 'v4'; // AWS signature version
 }
 
-// 添加传输模式枚举
+// Transfer mode enumeration
 export enum TransferMode {
-  AUTO = 'auto',           // 自动选择最佳模式
-  MEMORY = 'memory',       // 使用内存中转
-  DISK = 'disk',           // 使用磁盘中转
-  STREAM = 'stream'        // 使用流传输（不缓存整个文件）
+  AUTO = 'auto',           // Automatically select the optimal transfer mode based on file size
+  DISK = 'disk',           // Use disk as intermediate storage (balance between performance and memory usage)
+  MEMORY = 'memory',       // Use memory as intermediate storage (best for small files, highest performance)
+  STREAM = 'stream'        // Use streaming transfer (best for large files, minimal memory usage)
 }
 
 export interface MigrationConfig {
@@ -29,13 +29,15 @@ export interface MigrationConfig {
   dryRun?: boolean;
   maxRetries?: number; // Maximum number of retry attempts for failed transfers
   verifyAfterMigration?: boolean; // Verify objects exist in target after migration
+  verifyFileContentAfterMigration?: boolean; // Verify file content integrity by comparing hashes after migration
   purgeSourceAfterMigration?: boolean; // Delete objects from source after successful migration
   skipConfirmation?: boolean; // Skip confirmation prompts
   verbose?: boolean; // Enable verbose logging
   logFile?: string; // Log file path for saving detailed logs
-  transferMode?: TransferMode; // 文件传输模式
-  tempDir?: string; // 临时文件目录（用于磁盘传输模式）
-  largeFileSizeThreshold?: number; // 大文件阈值（字节），超过此大小将使用其他传输模式
+  transferMode?: TransferMode; // File transfer mode
+  tempDir?: string; // Temporary directory for disk transfer mode
+  largeFileSizeThreshold?: number; // Large file threshold (bytes), files larger than this will use alternative transfer modes
+  skipTargetExistenceCheck?: boolean; // Skip checking if files already exist in target bucket
 }
 
 // File transfer status
@@ -43,11 +45,13 @@ export enum TransferStatus {
   PENDING = 'pending',
   DOWNLOADING = 'downloading',
   UPLOADING = 'uploading',
+  STREAMING = 'streaming',
   SUCCEEDED = 'succeeded',
   FAILED = 'failed',
   SKIPPED = 'skipped',
   RETRYING = 'retrying',
-  VERIFICATION_FAILED = 'verification_failed'
+  VERIFICATION_FAILED = 'verification_failed',
+  CONTENT_VERIFICATION_FAILED = 'content_verification_failed'
 }
 
 // File transfer information
@@ -61,6 +65,9 @@ export interface FileTransfer {
   uploadSpeed?: number; // bytes per second
   progress?: number; // 0-100
   verified?: boolean; // Whether the file was verified in the target bucket
-  transferMode?: TransferMode; // 使用的传输模式
-  tempFilePath?: string; // 临时文件路径（用于磁盘传输模式）
+  contentVerified?: boolean; // Whether the file content was verified by hash comparison
+  sourceHash?: string; // Hash of the source file content
+  targetHash?: string; // Hash of the target file content
+  transferMode?: TransferMode; // Transfer mode used
+  tempFilePath?: string; // Temporary file path (for disk transfer mode)
 }

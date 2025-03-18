@@ -1,7 +1,12 @@
-import fs from 'fs';
-import path from 'path';
+// Node.js built-in modules
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Third-party dependencies
 import chalk from 'chalk';
-import os from 'os';
+
+// Types
 import type { MigrationConfig } from './types';
 
 // Log levels
@@ -116,18 +121,21 @@ export function log(level: LogLevel, message: string, skipConsole = false): void
     return;
   }
 
-  // Format message for console output
+  // Format message for console output with level prefix and appropriate color
   let consoleMessage: string;
 
   switch (level) {
+    case LogLevel.INFO:
+      consoleMessage = chalk.blue(`[INFO] ${message}`);
+      break;
     case LogLevel.SUCCESS:
-      consoleMessage = chalk.green(message);
+      consoleMessage = chalk.green(`[SUCCESS] ${message}`);
       break;
     case LogLevel.WARNING:
-      consoleMessage = chalk.yellow(message);
+      consoleMessage = chalk.yellow(`[WARNING] ${message}`);
       break;
     case LogLevel.ERROR:
-      consoleMessage = chalk.red(message);
+      consoleMessage = chalk.red(`[ERROR] ${message}`);
       break;
     case LogLevel.DEBUG:
       consoleMessage = chalk.gray(`[DEBUG] ${message}`);
@@ -180,4 +188,31 @@ export function logSuccess(message: string): void {
  */
 export function logWarning(message: string): void {
   log(LogLevel.WARNING, message);
+}
+
+/**
+ * Log an info message with custom color
+ */
+export function logInfo(message: string, color?: (message: string) => string): void {
+  if (color) {
+    // Use custom color if provided
+    const customMessage = color(message);
+    log(LogLevel.INFO, customMessage, false);
+  } else {
+    // Use default info color
+    log(LogLevel.INFO, message);
+  }
+}
+
+/**
+ * Log message only to file, never to console (for stalled transfer detection)
+ * This is used for logging stalled transfers without cluttering the console
+ */
+export function logSilent(message: string, level: LogLevel = LogLevel.WARNING): void {
+  // Write to log file only
+  if (logStream) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level}] [${executionId}] ${message}`;
+    logStream.write(logMessage + '\n');
+  }
 }
