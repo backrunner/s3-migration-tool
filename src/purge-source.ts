@@ -297,6 +297,8 @@ export async function purgeSourceBucket(
       // Delete objects in batches
       const batchSize = 1000; // AWS allows max 1000 keys per delete operation
       let processedCount = 0;
+      let successfullyDeletedCount = 0;
+      let failedDeleteCount = 0;
 
       for (let i = 0; i < keysToDelete.length; i += batchSize) {
         const batch = keysToDelete.slice(i, i + batchSize);
@@ -305,6 +307,9 @@ export async function purgeSourceBucket(
           const result = await deleteObjects(sourceClient, config.source.bucket, batch);
           processedCount += batch.length;
           progressBar.update(processedCount);
+
+          successfullyDeletedCount += result.deleted.length;
+          failedDeleteCount += result.failed.length;
 
           result.deleted.forEach(key => {
             logVerbose(`Deleted: ${key}`);
@@ -315,6 +320,8 @@ export async function purgeSourceBucket(
           });
         } catch (error) {
           logError(`Error deleting batch of objects: ${(error as Error).message}`);
+          // If the entire batch fails, count all as failed
+          failedDeleteCount += batch.length;
         }
       }
 
@@ -322,6 +329,8 @@ export async function purgeSourceBucket(
 
       // Compute final stats
       result.endTime = Date.now();
+      result.deleted = successfullyDeletedCount;
+      result.failed = failedDeleteCount;
 
       // Print summary
       const elapsedTime = Math.floor((result.endTime - result.startTime) / 1000);
@@ -331,7 +340,11 @@ export async function purgeSourceBucket(
       logInfo('Purge Operation Summary', chalk.cyanBright.bold);
       logInfo('─'.repeat(50), chalk.white);
       logInfo(`Total objects:      ${result.total.toString()}`, chalk.white);
-      logInfo(`Deleted:            ${(result.total - result.missingInTarget).toString()}`, chalk.green);
+      logInfo(`Deleted:            ${result.deleted.toString()}`, chalk.green);
+
+      if (result.failed > 0) {
+        logInfo(`Failed to delete:   ${result.failed.toString()}`, chalk.red);
+      }
 
       if (result.missingInTarget > 0) {
         logInfo(`Skipped (missing):  ${result.missingInTarget.toString()}`, chalk.yellow);
